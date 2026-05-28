@@ -1,13 +1,24 @@
 from setuptools import find_packages, setup
 
+CONVERT_REQUIRES = [
+    "MNN>=3.5.0",
+    "av>=14",
+    "librosa>=0.10.2",
+    "numpy>=1.26",
+    "onnx>=1.16",
+    "onnxruntime>=1.18",
+    "pyyaml>=6.0.1",
+    "torch>=2.7.1",
+]
+
 setup(
     name="pymss",
     version="2.0.2",
     packages=find_packages(),
-    description="Python package for music source separation.",
+    description="MNN conversion support package for music source separation models.",
     long_description=open("README.md", encoding="utf-8").read(),
     long_description_content_type="text/markdown",
-    url="https://github.com/pymss-project/pymss",
+    url="https://github.com/pymss-project/pymss-mnn",
     author="KitsuneX07",
     maintainer="baicai1145",
     author_email="ghast1085654218@163.com",
@@ -33,18 +44,15 @@ setup(
         "pymss": ["resources/model_catalog.json", "resources/vr_modelparams/*.json"],
     },
     install_requires=[
-        "av>=14",
-        "librosa>=0.10.2",
-        "numpy>=1.26",
-        "pyyaml>=6.0.1",
-        "torch>=2.7.1",
         "tqdm>=4.60",
-        "mlx>=0.31.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
     ],
+    extras_require={
+        "convert": CONVERT_REQUIRES,
+    },
     project_urls={
-        "Bug Tracker": "https://github.com/pymss-project/pymss/issues",
-        "Source Code": "https://github.com/pymss-project/pymss",
-        "Documentation": "https://github.com/pymss-project/pymss/blob/main/README.md",
+        "Bug Tracker": "https://github.com/pymss-project/pymss-mnn/issues",
+        "Source Code": "https://github.com/pymss-project/pymss-mnn",
+        "Documentation": "https://github.com/pymss-project/pymss-mnn/blob/main/README.md",
     },
     entry_points={
         "console_scripts": [
