@@ -165,15 +165,3 @@ def resolve_model(model_name, model_dir=None, require_supported=True, require_ex
         "model_path": str(model_path),
         "config_path": str(config_path) if config_path else None,
     }
-
-
-def create_separator(model_name, model_dir=None, **separator_kwargs):
-    from .separator import MSSeparator
-
-    resolved = resolve_model(model_name, model_dir=model_dir, require_supported=True, require_exists=True)
-    return MSSeparator(
-        model_type=resolved["model_type"],
-        model_path=resolved["model_path"],
-        config_path=resolved["config_path"],
-        **separator_kwargs,
-    )
