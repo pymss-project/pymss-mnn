@@ -1,0 +1,97 @@
+#include "mss_mnn/roformer_separator.hpp"
+
+#include <exception>
+#include <filesystem>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+
+namespace {
+
+struct Args {
+    std::string preset;
+    std::string segment_dir;
+    std::string metadata;
+    std::string input_wav;
+    std::string output_dir;
+    mss_mnn::MNNBackend backend = mss_mnn::MNNBackend::CPU;
+    int threads = 1;
+};
+
+void usage(const char* argv0) {
+    std::cerr
+        << "Usage: " << argv0 << " --preset bsr_hyperace_voc --segments dir --metadata file.json "
+        << "--input input.wav --output-dir out [--backend cpu|auto|metal|opencl|vulkan] [--threads 1]\n";
+}
+
+Args parse_args(int argc, char** argv) {
+    Args args;
+    for (int i = 1; i < argc; ++i) {
+        const std::string key = argv[i];
+        auto require_value = [&](const std::string& option) -> std::string {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("missing value for " + option);
+            }
+            return argv[++i];
+        };
+        if (key == "--preset") {
+            args.preset = require_value(key);
+        } else if (key == "--segments") {
+            args.segment_dir = require_value(key);
+        } else if (key == "--metadata") {
+            args.metadata = require_value(key);
+        } else if (key == "--input") {
+            args.input_wav = require_value(key);
+        } else if (key == "--output-dir") {
+            args.output_dir = require_value(key);
+        } else if (key == "--backend") {
+            args.backend = mss_mnn::mnn_backend_from_name(require_value(key));
+        } else if (key == "--threads") {
+            args.threads = std::stoi(require_value(key));
+        } else if (key == "--help" || key == "-h") {
+            usage(argv[0]);
+            std::exit(0);
+        } else {
+            throw std::runtime_error("unknown option: " + key);
+        }
+    }
+    if (args.preset.empty() || args.segment_dir.empty() || args.metadata.empty() || args.input_wav.empty() || args.output_dir.empty()) {
+        throw std::runtime_error("missing required arguments");
+    }
+    return args;
+}
+
+std::string basename_no_ext(const std::string& path) {
+    const auto stem = std::filesystem::path(path).stem().string();
+    return stem.empty() ? "audio" : stem;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    try {
+        const Args args = parse_args(argc, argv);
+        mss_mnn::RoformerSeparatorOptions options;
+        options.segment_dir = args.segment_dir;
+        options.metadata_path = args.metadata;
+        options.backend = args.backend;
+        options.threads = args.threads;
+
+        mss_mnn::RoformerSeparator separator(options);
+        const auto input = mss_mnn::read_wav(args.input_wav);
+        const auto outputs = separator.separate(input);
+
+        std::filesystem::create_directories(args.output_dir);
+        const auto& metadata = separator.metadata();
+        const std::string stem_base = basename_no_ext(args.input_wav);
+        for (std::size_t stem = 0; stem < outputs.size(); ++stem) {
+            const std::string name = stem < metadata.source_names.size() ? metadata.source_names[stem] : std::to_string(stem);
+            mss_mnn::write_wav_float32(args.output_dir + "/" + stem_base + "_" + name + ".wav", outputs[stem]);
+        }
+        return 0;
+    } catch (const std::exception& exc) {
+        std::cerr << "error: " << exc.what() << "\n";
+        usage(argv[0]);
+        return 1;
+    }
+}
