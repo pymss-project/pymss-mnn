@@ -37,6 +37,9 @@ struct RoformerSegmentManifest {
     int dim = 256;
     int time_batch = 1;
     int freq_batch = 16;
+    int mask_group_size = 1;
+    int transformer_block_size = 0;
+    int transformer_block_count = 0;
     std::string attention_op = "manual";
     std::string transformer_split = "fused";
     std::vector<int> dim_inputs;
@@ -51,6 +54,7 @@ enum class RoformerPrecisionPolicy {
 enum class RoformerSegmentCachePolicy {
     All,
     TransformersOnly,
+    BlocksOnly,
     None,
 };
 
@@ -61,12 +65,14 @@ std::string roformer_segment_cache_policy_name(RoformerSegmentCachePolicy policy
 
 struct RoformerSeparatorOptions {
     std::string segment_dir;
+    std::string core_model_path;
     std::string metadata_path;
     MNNBackend backend = MNNBackend::CPU;
     MNNPrecision precision = MNNPrecision::Auto;
     RoformerPrecisionPolicy precision_policy = RoformerPrecisionPolicy::MetalFast;
     RoformerSegmentCachePolicy segment_cache_policy = RoformerSegmentCachePolicy::TransformersOnly;
     int threads = 1;
+    bool profile = false;
 };
 
 RoformerMetadata load_roformer_metadata(const std::string& path);

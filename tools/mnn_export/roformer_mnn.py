@@ -41,6 +41,23 @@ class BandSplitWrapper(torch.nn.Module):
         return self.model.band_split(x)
 
 
+class RoformerBlockWrapper(torch.nn.Module):
+    def __init__(self, model: torch.nn.Module, start_layer: int, end_layer: int):
+        super().__init__()
+        self.model = model
+        self.start_layer = int(start_layer)
+        self.end_layer = int(end_layer)
+
+    def forward(self, x):
+        for time_transformer, freq_transformer in self.model.layers[self.start_layer : self.end_layer]:
+            batch, frames, bands, dim = x.shape
+            x = time_transformer(
+                x.permute(0, 2, 1, 3).reshape(batch * bands, frames, dim)
+            ).reshape(batch, bands, frames, dim).permute(0, 2, 1, 3)
+            x = freq_transformer(x.reshape(batch * frames, bands, dim)).reshape(batch, frames, bands, dim)
+        return x
+
+
 class MaskHeadWrapper(torch.nn.Module):
     def __init__(self, model: torch.nn.Module):
         super().__init__()
@@ -160,8 +177,8 @@ def write_metadata(path: Path, preset: RoformerMNNPreset, separator: MSSeparator
         "output_shape": list(output_shape),
         "mask_mode": str(getattr(model, "mask_mode", preset.mask_mode)),
         "sample_rate": int(config.audio.sample_rate),
-        "chunk_size": int(config.audio.chunk_size),
-        "overlap_size": int(config.inference.overlap_size),
+        "chunk_size": int(preset.chunk_size),
+        "overlap_size": int(preset.overlap_size),
         "source_names": list(preset.source_names),
         "stft": {
             "n_fft": int(model.stft_kwargs["n_fft"]),

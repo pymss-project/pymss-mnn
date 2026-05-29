@@ -34,6 +34,11 @@ class ExprMicroRuntime:
         self.dim_inputs = tuple(int(value) for value in self.manifest.get("dim_inputs", ()))
         self.mask_mode = str(self.manifest.get("mask_mode", "no_segm"))
         self.transformer_split = str(self.manifest.get("transformer_split", "fused"))
+        self.transformer_block_size = max(0, int(self.manifest.get("transformer_block_size", 0)))
+        self.transformer_block_count = max(0, int(self.manifest.get("transformer_block_count", 0)))
+        if self.transformer_block_size and self.transformer_block_count == 0:
+            self.transformer_block_count = (depth + self.transformer_block_size - 1) // self.transformer_block_size
+        self.mask_group_size = max(1, int(self.manifest.get("mask_group_size", 1)))
         manifest_depth = self.manifest.get("depth")
         if manifest_depth is not None and int(manifest_depth) != depth:
             raise ValueError(f"manifest depth {manifest_depth} does not match runtime depth {depth}")
@@ -46,6 +51,8 @@ class ExprMicroRuntime:
             return "mnn_segm"
         if self.mask_mode == "full" and (self.segment_dir / "segm_00.mnn").exists():
             return "mnn_mask_bands_plus_segm"
+        if self.dim_inputs and (self.segment_dir / "mask_group_00.mnn").exists():
+            return "mnn_mask_groups"
         if self.dim_inputs and (self.segment_dir / "mask_band_00.mnn").exists():
             return "mnn_mask_bands"
         return "mnn_mask_head"
@@ -96,37 +103,74 @@ class ExprMicroRuntime:
         out[...] = flat_out.reshape(batch, frames, bands, dim)
         return out
 
+    def run_transformer_blocks(self, x: np.ndarray) -> np.ndarray:
+        for block_index in range(self.transformer_block_count):
+            name = f"block_{block_index:02d}"
+            x = np.ascontiguousarray(self.run(name, x))
+            self._runners.pop(name, None)
+            gc.collect()
+        return x
+
     def __call__(self, stft_repr: np.ndarray) -> np.ndarray:
         x = self.run("band_split", stft_repr)
-        for layer_index in range(self.depth):
-            x = np.ascontiguousarray(self.run_time(layer_index, x))
-            x = np.ascontiguousarray(self.run_freq(layer_index, x))
+        if self.transformer_block_size:
+            x = self.run_transformer_blocks(x)
+        else:
+            for layer_index in range(self.depth):
+                x = np.ascontiguousarray(self.run_time(layer_index, x))
+                x = np.ascontiguousarray(self.run_freq(layer_index, x))
         if self.mask_head is not None:
             with torch.inference_mode():
                 return self.mask_head(torch.from_numpy(x)).detach().cpu().numpy()
         if self.dim_inputs and (
-            (self.segment_dir / "mask_band_00.mnn").exists()
+            (self.segment_dir / "mask_group_00.mnn").exists()
+            or (self.segment_dir / "mask_band_00.mnn").exists()
             or (self.mask_mode == "segm_only" and (self.segment_dir / "segm_00.mnn").exists())
         ):
             return self.run_mask_bands(x)
         return self.run("mask_head", x)
+
+    def _run_grouped_mask_bands(self, x: np.ndarray) -> np.ndarray:
+        batch, frames, bands, dim = x.shape
+        flat_dim = sum(self.dim_inputs)
+        output = np.zeros((batch, self.manifest["output_shape"][1], frames, flat_dim), dtype=np.float32)
+        offset = 0
+        group_index = 0
+        for band_start in range(0, bands, self.mask_group_size):
+            band_count = min(self.mask_group_size, bands - band_start)
+            group_dims = self.dim_inputs[band_start : band_start + band_count]
+            group_width = sum(group_dims)
+            group_x = np.ascontiguousarray(x[:, :, band_start : band_start + band_count, :])
+            group_out = self.run(f"mask_group_{group_index:02d}", group_x)
+            expected = (batch, output.shape[1], frames, group_width)
+            if tuple(group_out.shape) != expected:
+                raise ValueError(f"mask group output shape {tuple(group_out.shape)} does not match {expected}")
+            output[:, :, :, offset : offset + group_width] = group_out
+            offset += group_width
+            group_index += 1
+        if offset != flat_dim:
+            raise ValueError(f"grouped mask width {offset} does not match sum(dim_inputs) {flat_dim}")
+        return output
 
     def run_mask_bands(self, x: np.ndarray) -> np.ndarray:
         if not self.dim_inputs:
             raise ValueError("manifest is missing dim_inputs for per-band mask execution")
         if len(self.dim_inputs) != x.shape[2]:
             raise ValueError(f"dim_inputs length {len(self.dim_inputs)} does not match band count {x.shape[2]}")
-        flat = None
-        if self.mask_mode != "segm_only":
-            for band_index in range(x.shape[2]):
-                path = self.segment_dir / f"mask_band_{band_index:02d}.mnn"
-                if not path.exists():
-                    raise FileNotFoundError(f"missing MNN mask band segment: {path}")
-            band_outputs = []
-            for band_index in range(x.shape[2]):
-                band_x = np.ascontiguousarray(x[:, :, band_index, :])
-                band_outputs.append(self.run(f"mask_band_{band_index:02d}", band_x))
-            flat = np.concatenate(band_outputs, axis=-1)
+        if self.mask_mode != "segm_only" and self.mask_group_size > 1:
+            flat = self._run_grouped_mask_bands(x)
+        else:
+            flat = None
+            if self.mask_mode != "segm_only":
+                for band_index in range(x.shape[2]):
+                    path = self.segment_dir / f"mask_band_{band_index:02d}.mnn"
+                    if not path.exists():
+                        raise FileNotFoundError(f"missing MNN mask band segment: {path}")
+                band_outputs = []
+                for band_index in range(x.shape[2]):
+                    band_x = np.ascontiguousarray(x[:, :, band_index, :])
+                    band_outputs.append(self.run(f"mask_band_{band_index:02d}", band_x))
+                flat = np.concatenate(band_outputs, axis=-1)
 
         if self.mask_mode != "no_segm":
             expected_shape = self.manifest.get("output_shape")
@@ -145,17 +189,19 @@ class ExprMicroRuntime:
 
         if flat is None:
             raise ValueError("no MNN mask output segments were executed")
-        batch, stems, frames, flat_dim = flat.shape
-        if flat_dim != sum(self.dim_inputs):
-            raise ValueError(f"concatenated mask width {flat_dim} does not match sum(dim_inputs) {sum(self.dim_inputs)}")
-        if flat_dim % 2:
-            raise ValueError(f"concatenated mask width must be even, got {flat_dim}")
-        output = flat.reshape(batch, stems, frames, flat_dim // 2, 2).transpose(0, 1, 3, 2, 4).copy()
+        if flat.ndim == 5:
+            output = flat
+        else:
+            batch, stems, frames, flat_dim = flat.shape
+            if flat_dim != sum(self.dim_inputs):
+                raise ValueError(f"concatenated mask width {flat_dim} does not match sum(dim_inputs) {sum(self.dim_inputs)}")
+            if flat_dim % 2:
+                raise ValueError(f"concatenated mask width must be even, got {flat_dim}")
+            output = flat.reshape(batch, stems, frames, flat_dim // 2, 2).transpose(0, 1, 3, 2, 4).copy()
         expected_shape = self.manifest.get("output_shape")
         if expected_shape is not None and list(output.shape) != list(expected_shape):
             raise ValueError(f"mask output shape {list(output.shape)} does not match manifest output_shape {expected_shape}")
         return output
-
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Validate low-memory expr micro-segmented MNN mask core.")

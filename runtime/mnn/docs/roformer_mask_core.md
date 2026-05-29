@@ -39,6 +39,41 @@ python tools/mnn_export/export_expr_micro_segments.py --preset bs_roformer_ep_36
 python tools/mnn_export/export_expr_micro_segments.py --preset mel_band_roformer_big --out-dir benchmark_results/mnn_work --time-batch 1 --freq-batch 16
 ```
 
+For fewer mask-head sessions without using the high-memory full-core graph,
+export grouped mask bands. `--mask-group-size 8` reduces BSR mask sessions from
+62 to 8 and MBR mask sessions from 60 to 8 while preserving exact output against
+the per-band export:
+
+```sh
+python tools/mnn_export/export_expr_micro_segments.py --preset bsr_hyperace_voc --out-dir benchmark_results/mnn_work --only mask_bands --mask-group-size 8 --time-batch 1 --freq-batch 16
+python tools/mnn_export/export_expr_micro_segments.py --preset mbr_deux --out-dir benchmark_results/mnn_work --only mask_bands --mask-group-size 8 --time-batch 1 --freq-batch 16
+python tools/mnn_export/export_expr_micro_segments.py --preset bsr_hyperace_voc --out-dir benchmark_results/mnn_work --only manifest --mask-group-size 8 --time-batch 1 --freq-batch 16
+python tools/mnn_export/export_expr_micro_segments.py --preset mbr_deux --out-dir benchmark_results/mnn_work --only manifest --mask-group-size 8 --time-batch 1 --freq-batch 16
+```
+
+Export a fixed-shape full mask core when maximum throughput is more important
+than the lowest peak memory:
+
+```sh
+python tools/mnn_export/export_roformer_mask_core.py \
+  --preset bsr_hyperace_voc \
+  --out-dir benchmark_results/mnn_core_fused
+```
+
+Run the C++ separator with the full-core graph:
+
+```sh
+runtime/mnn/build/mss_mnn_roformer_separate \
+  --preset bsr_hyperace_voc \
+  --core-model benchmark_results/mnn_core_fused/bsr_hyperace_voc/bsr_hyperace_voc_mask_core.mnn \
+  --metadata benchmark_results/mnn_core_fused/bsr_hyperace_voc/bsr_hyperace_voc_metadata.json \
+  --input benchmark_results/mnn_work/cpp_e2e/input/test_3s.wav \
+  --output-dir benchmark_results/mnn_work/cpp_e2e/bsr_core_metal \
+  --backend metal \
+  --precision high \
+  --threads 1
+```
+
 Refresh manifests after partial re-export:
 
 ```sh
@@ -182,6 +217,11 @@ metal-autocast` for tighter CPU/Metal parity, and `--precision high
 `--segment-cache all` for maximum throughput, or `--segment-cache none` only
 when profiling backend allocation behavior.
 
+The Expr exporter maps RoFormer FFN GELU to MNN's native `UnaryOp GELU`.
+This avoids the Metal fallback triggered by the previous `ERF`-based exact
+formula. MNN's `GELU` is the tanh approximation, so keep block or end-to-end
+quality checks in the validation loop when refreshing exported artifacts.
+
 ```sh
 runtime/mnn/build/mss_mnn_roformer_separate \
   --preset bsr_hyperace_voc \
@@ -234,3 +274,144 @@ layer_00 FFN Normal/FP16, single-segment CPU High vs Metal Normal:
   bsr time_ffn rmse=1.06e-03, freq_ffn rmse=1.24e-03
   mbr time_ffn rmse=4.43e-03, freq_ffn rmse=4.14e-03
 ```
+
+The same machine on a 60-second `test.m4a` slice produced the following for
+split native-attention exports:
+
+```text
+bsr_hyperace_voc, metal-fast:
+  time=201.76s, RTF=3.36, speed=0.30x realtime
+  peak_footprint=2.51GB, max_rss=0.97GB
+
+bsr_hyperace_voc, metal-autocast:
+  time=203.81s, RTF=3.40, speed=0.29x realtime
+  peak_footprint=3.09GB, max_rss=1.29GB
+
+mbr_deux, metal-fast:
+  time=249.49s, RTF=4.16, speed=0.24x realtime
+  peak_footprint=4.61GB, max_rss=1.48GB
+
+mbr_deux, metal-autocast:
+  time=242.70s, RTF=4.05, speed=0.25x realtime
+  peak_footprint=7.38GB, max_rss=3.11GB
+```
+
+For throughput, session count currently matters more than native `Attention`.
+The manual/fused export keeps `freq_batch=16`, so it runs far fewer MNN sessions
+than split native attention with `freq_batch=1`:
+
+```text
+bsr_hyperace_voc manual/fused, metal-fast:
+  time=132.85s, RTF=2.21, speed=0.45x realtime
+  peak_footprint=2.45GB, max_rss=1.10GB
+
+mbr_deux manual/fused, metal-fast:
+  time=190.52s, RTF=3.18, speed=0.31x realtime
+  peak_footprint=4.70GB, max_rss=1.75GB
+
+bsr_hyperace_voc manual/fused + mask_group_size=8, metal-fast:
+  time=126.83s, RTF=2.11, speed=0.47x realtime
+  peak_footprint=2.44GB, max_rss=1.49GB
+  vs per-band output: max_abs=0, rmse=0
+
+mbr_deux manual/fused + mask_group_size=8, metal-fast:
+  time=158.55s, RTF=2.64, speed=0.38x realtime
+  peak_footprint=4.40GB, max_rss=2.53GB
+  vs per-band output: max_abs=0, rmse=0
+
+mbr_deux manual/fused + mask_group_size=8 + cached mask groups, metal-fast:
+  time=135.89s, RTF=2.26, speed=0.44x realtime
+  peak_footprint=4.35GB, max_rss=2.16GB
+  vs uncached grouped output: max_abs=0, rmse=0
+
+bsr_hyperace_voc manual/fused + mask_group_size=8 + cached mask groups, metal-fast:
+  time=119.49s, RTF=1.99, speed=0.50x realtime
+  peak_footprint=2.08GB, max_rss=1.12GB
+  vs uncached grouped output: max_abs=0, rmse=0
+```
+
+Profiling shows the remaining bottleneck is transformer sessions, not DSP:
+MBR grouped/cached spends about `76.7s` in time transformer sessions and `50.0s`
+in frequency transformer sessions out of `134.7s` total. BSR grouped/cached
+spends about `61.8s` in time transformer sessions and `51.6s` in frequency
+transformer sessions out of `118.8s` total. STFT, ISTFT, overlap-add, and
+mask application together are below 1.5 seconds per 60-second file.
+
+Use the C++ CLI `--profile` flag to print the same per-stage timing table.
+
+`time_batch > 1` is implemented in the C++ runner but is not a validated Metal
+speed path yet. On the same 60-second BSR slice, `time_batch=2` finished in
+`107.27s` but produced all-NaN audio, and `time_batch=4` exited abnormally after
+`111.41s`. Keep `time_batch=1` for release-quality Metal exports until a target
+backend has separate correctness validation.
+
+Block-core exports are the next reduction step for the small-session bottleneck:
+
+```bash
+python tools/mnn_export/export_expr_micro_segments.py \
+  --preset bsr_hyperace_voc \
+  --out-dir benchmark_results/mnn_work \
+  --transformer-block-size 1 \
+  --transformer-block-mode batched \
+  --mask-group-size 8 \
+  --time-batch 1 \
+  --freq-batch 16
+```
+
+The batched block path expands rotary constants along the batch axis explicitly;
+this avoids the MNN broadcast error that made earlier `time_batch > 1` and
+naive block exports numerically invalid. A one-block CPU check for
+`bsr_hyperace_voc` matched PyTorch at `rmse=7.34e-07`. The diagnostic
+`--transformer-block-mode unrolled` keeps the original band-wise time
+transformer semantics inside one graph, but it creates very large model files
+and should not be used as the mobile default. The C++ runtime does not cache
+`block_*.mnn` sessions by default to avoid 16GB-class memory pressure.
+
+For mobile memory work, reduce the fixed frame count instead of only changing
+session granularity:
+
+```bash
+python tools/mnn_export/export_expr_micro_segments.py \
+  --preset bsr_hyperace_voc \
+  --variant-name bsr_hyperace_voc_f180 \
+  --frames 180 \
+  --out-dir benchmark_results/mnn_work \
+  --transformer-block-size 1 \
+  --transformer-block-mode batched \
+  --mask-group-size 8
+```
+
+For `bsr_hyperace_voc`, `--frames 180` produces metadata shape
+`[1, 2050, 180, 2]`, `chunk_size=91648`, and `overlap_size=4582`. A 1-second
+Metal smoke test with `precision=Normal`, `segment_cache=None`, and block
+segments finished with `peak memory footprint=1.93GB`, below the 2GB mobile
+target. The steady-state RTF estimate is about `2.24` (`~0.45x` realtime) from
+the 1-second smoke profile. Time attention memory scales with `frames^2`, so
+this cuts the main attention working set to roughly 3.7% of the default
+938-frame export per chunk. Larger probes did not meet the same local target:
+`frames=256` exited abnormally at `peak memory footprint=3.17GB`, `frames=192`
+exited abnormally at `2.10GB`, and `frames=184` exited abnormally at `1.98GB`
+on the 16GB M4 MacBook Air test machine.
+
+The historical unsplit native-attention `freq_batch=16` probe was rejected:
+it ran `bsr_hyperace_voc` in `143.87s` but changed the 60-second vocals output
+by `rmse=1.36e-01`, so current native `Attention` exports must keep
+`freq_batch=1` for correctness.
+
+The full-core BSR graph cuts each chunk to one MNN session. With the freshly
+exported `benchmark_results/mnn_core_fused/bsr_hyperace_voc` graph:
+
+```text
+bsr_hyperace_voc full mask core, Metal High:
+  time=64.57s, RTF=1.08, speed=0.93x realtime
+  peak_footprint=5.92GB, max_rss=1.04GB
+  vs manual/fused: mean_abs=3.07e-04, rmse=5.52e-04
+
+bsr_hyperace_voc full mask core, Metal Normal:
+  time=49.81s, RTF=0.83, speed=1.20x realtime
+  peak_footprint=3.48GB, max_rss=1.12GB
+  rejected: vs High rmse=2.00e-02
+```
+
+The MBR full-core graph currently converts but returns all-zero MNN output on a
+random mask-core input, so it is not a valid speed path yet.

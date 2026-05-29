@@ -51,6 +51,13 @@ struct MNNModelOptions {
     int attention_option = 0;
 };
 
+struct MNNRunProfile {
+    double resize_ms = 0.0;
+    double input_copy_ms = 0.0;
+    double run_ms = 0.0;
+    double output_copy_ms = 0.0;
+};
+
 class MNNModel {
 public:
     MNNModel(const std::string& model_path, MNNModelOptions options = {});
@@ -78,7 +85,7 @@ public:
     MNNMaskCore(MNNMaskCore&&) noexcept;
     MNNMaskCore& operator=(MNNMaskCore&&) noexcept;
 
-    std::vector<float> run(const std::vector<float>& input, const std::vector<int>& input_shape);
+    std::vector<float> run(const std::vector<float>& input, const std::vector<int>& input_shape, MNNRunProfile* profile = nullptr);
     const std::vector<int>& output_shape() const;
 
 private:

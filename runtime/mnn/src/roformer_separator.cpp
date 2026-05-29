@@ -1,14 +1,20 @@
 #include "mss_mnn/roformer_separator.hpp"
 
+#include "apple_autorelease_pool.hpp"
+
 #include <algorithm>
+#include <chrono>
 #include <cctype>
 #include <cmath>
 #include <complex>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <fstream>
+#include <iomanip>
+#include <iostream>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
@@ -20,6 +26,74 @@
 namespace mss_mnn {
 
 using Complex = std::complex<float>;
+using Clock = std::chrono::steady_clock;
+
+double elapsed_ms(Clock::time_point start) {
+    const auto elapsed = Clock::now() - start;
+    return std::chrono::duration<double, std::milli>(elapsed).count();
+}
+
+struct ProfileCounter {
+    double total_ms = 0.0;
+    int calls = 0;
+};
+
+class ProfileRecorder {
+public:
+    explicit ProfileRecorder(bool enabled) : enabled_(enabled) {}
+
+    bool enabled() const {
+        return enabled_;
+    }
+
+    void add(const std::string& name, double ms) {
+        if (!enabled_) {
+            return;
+        }
+        auto& counter = counters_[name];
+        counter.total_ms += ms;
+        counter.calls += 1;
+    }
+
+    void add_mnn_run(const std::string& stage, const MNNRunProfile& profile) {
+        if (!enabled_) {
+            return;
+        }
+        add("mnn." + stage + ".resize", profile.resize_ms);
+        add("mnn." + stage + ".input_copy", profile.input_copy_ms);
+        add("mnn." + stage + ".run_session", profile.run_ms);
+        add("mnn." + stage + ".output_copy", profile.output_copy_ms);
+        add("mnn." + stage + ".total", profile.resize_ms + profile.input_copy_ms + profile.run_ms + profile.output_copy_ms);
+    }
+
+    void print(std::ostream& stream) const {
+        if (!enabled_) {
+            return;
+        }
+        std::fflush(nullptr);
+        std::vector<std::pair<std::string, ProfileCounter>> items(counters_.begin(), counters_.end());
+        std::sort(items.begin(), items.end(), [](const auto& a, const auto& b) {
+            return a.second.total_ms > b.second.total_ms;
+        });
+        stream << "\n[MSS MNN profile]\n";
+        stream << std::left << std::setw(36) << "stage"
+               << std::right << std::setw(12) << "total_ms"
+               << std::setw(10) << "calls"
+               << std::setw(12) << "avg_ms" << "\n";
+        for (const auto& item : items) {
+            const auto& counter = item.second;
+            const double avg = counter.calls > 0 ? counter.total_ms / counter.calls : 0.0;
+            stream << std::left << std::setw(36) << item.first
+                   << std::right << std::setw(12) << std::fixed << std::setprecision(2) << counter.total_ms
+                   << std::setw(10) << counter.calls
+                   << std::setw(12) << std::fixed << std::setprecision(2) << avg << "\n";
+        }
+    }
+
+private:
+    bool enabled_ = false;
+    std::unordered_map<std::string, ProfileCounter> counters_;
+};
 
 std::string read_text(const std::string& path) {
     std::ifstream stream(path);
@@ -54,6 +128,14 @@ std::size_t find_value_start(const std::string& text, const std::string& key) {
 int json_int(const std::string& text, const std::string& key) {
     const auto pos = find_value_start(text, key);
     return std::stoi(text.substr(pos));
+}
+
+int json_int_or_default(const std::string& text, const std::string& key, int fallback) {
+    const std::string needle = "\"" + key + "\"";
+    if (text.find(needle) == std::string::npos) {
+        return fallback;
+    }
+    return json_int(text, key);
 }
 
 std::string json_string(const std::string& text, const std::string& key) {
@@ -202,6 +284,12 @@ RoformerSegmentManifest load_roformer_manifest(const std::string& segment_dir) {
     manifest.num_bands = json_int(text, "num_bands");
     manifest.time_batch = json_int(text, "time_batch");
     manifest.freq_batch = json_int(text, "freq_batch");
+    manifest.mask_group_size = std::max(1, json_int_or_default(text, "mask_group_size", 1));
+    manifest.transformer_block_size = std::max(0, json_int_or_default(text, "transformer_block_size", 0));
+    manifest.transformer_block_count = std::max(0, json_int_or_default(text, "transformer_block_count", 0));
+    if (manifest.transformer_block_size > 0 && manifest.transformer_block_count == 0) {
+        manifest.transformer_block_count = (manifest.depth + manifest.transformer_block_size - 1) / manifest.transformer_block_size;
+    }
     manifest.attention_op = json_string_or_default(text, "attention_op", "manual");
     manifest.transformer_split = json_string_or_default(text, "transformer_split", "fused");
     manifest.dim_inputs = json_int_array(text, "dim_inputs");
@@ -253,6 +341,9 @@ RoformerSegmentCachePolicy roformer_segment_cache_policy_from_name(const std::st
     if (value == "transformers" || value == "transformer" || value == "core") {
         return RoformerSegmentCachePolicy::TransformersOnly;
     }
+    if (value == "blocks" || value == "block") {
+        return RoformerSegmentCachePolicy::BlocksOnly;
+    }
     if (value == "none" || value == "off" || value == "no-cache") {
         return RoformerSegmentCachePolicy::None;
     }
@@ -265,6 +356,8 @@ std::string roformer_segment_cache_policy_name(RoformerSegmentCachePolicy policy
             return "all";
         case RoformerSegmentCachePolicy::TransformersOnly:
             return "transformers";
+        case RoformerSegmentCachePolicy::BlocksOnly:
+            return "blocks";
         case RoformerSegmentCachePolicy::None:
             return "none";
     }
@@ -487,7 +580,8 @@ public:
                    MNNPrecision precision,
                    RoformerPrecisionPolicy precision_policy,
                    RoformerSegmentCachePolicy segment_cache_policy,
-                   int threads)
+                   int threads,
+                   ProfileRecorder* profile)
         : segment_dir_(std::move(segment_dir)),
           manifest_(manifest),
           stems_(stems),
@@ -496,83 +590,162 @@ public:
           precision_(precision),
           precision_policy_(precision_policy),
           segment_cache_policy_(segment_cache_policy),
-          threads_(threads) {}
+          threads_(threads),
+          profile_(profile) {}
 
     std::vector<float> run(const std::string& name, const std::vector<float>& input, const std::vector<int>& shape) {
+        ScopedAutoreleasePool autorelease_pool;
+        MNNRunProfile run_profile;
+        const auto start = Clock::now();
+        std::vector<float> output;
         if (!should_cache(name)) {
-            return create_runner(name).run(input, shape);
+            auto runner = create_runner(name);
+            output = runner.run(input, shape, &run_profile);
+        } else {
+            auto it = runners_.find(name);
+            if (it == runners_.end()) {
+                it = runners_.emplace(name, create_runner(name)).first;
+            }
+            output = it->second.run(input, shape, &run_profile);
         }
-        auto it = runners_.find(name);
-        if (it == runners_.end()) {
-            it = runners_.emplace(name, create_runner(name)).first;
+        if (profile_ && profile_->enabled()) {
+            const std::string stage = profile_stage(name);
+            profile_->add_mnn_run(stage, run_profile);
+            profile_->add("segment." + stage + ".wall", elapsed_ms(start));
         }
-        return it->second.run(input, shape);
+        return output;
     }
 
     std::vector<float> operator()(const std::vector<float>& stft_repr, int freq_channels, int frames) {
         std::vector<float> x = run("band_split", stft_repr, {1, freq_channels, frames, 2});
         const int bands = manifest_.num_bands;
         const int dim = manifest_.dim;
-        for (int layer = 0; layer < manifest_.depth; ++layer) {
-            std::vector<float> next(x.size());
-            for (int band = 0; band < bands; ++band) {
-                std::vector<float> in(static_cast<std::size_t>(frames * dim));
-                for (int t = 0; t < frames; ++t) {
-                    const std::size_t src = ((static_cast<std::size_t>(t) * bands + band) * dim);
-                    std::copy(x.begin() + static_cast<std::ptrdiff_t>(src), x.begin() + static_cast<std::ptrdiff_t>(src + dim), in.begin() + static_cast<std::ptrdiff_t>(t * dim));
-                }
-                auto out = run_transformer("layer_" + two(layer) + "_time", in, {1, frames, dim});
-                for (int t = 0; t < frames; ++t) {
-                    const std::size_t dst = ((static_cast<std::size_t>(t) * bands + band) * dim);
-                    std::copy(out.begin() + static_cast<std::ptrdiff_t>(t * dim), out.begin() + static_cast<std::ptrdiff_t>((t + 1) * dim), next.begin() + static_cast<std::ptrdiff_t>(dst));
+        if (manifest_.transformer_block_size > 0) {
+            const int block_count = manifest_.transformer_block_count > 0
+                                        ? manifest_.transformer_block_count
+                                        : (manifest_.depth + manifest_.transformer_block_size - 1) / manifest_.transformer_block_size;
+            for (int block = 0; block < block_count; ++block) {
+                x = run("block_" + two(block), x, {1, frames, bands, dim});
+                if (static_cast<int>(x.size()) != frames * bands * dim) {
+                    throw std::runtime_error("transformer block output size does not match band shape");
                 }
             }
-            x.swap(next);
-            next.assign(x.size(), 0.0f);
-            for (int start = 0; start < frames; start += manifest_.freq_batch) {
-                const int actual = std::min(manifest_.freq_batch, frames - start);
-                std::vector<float> in(static_cast<std::size_t>(manifest_.freq_batch * bands * dim), 0.0f);
-                for (int t = 0; t < actual; ++t) {
-                    const std::size_t src = (static_cast<std::size_t>(start + t) * bands * dim);
-                    const std::size_t dst = static_cast<std::size_t>(t) * bands * dim;
-                    std::copy(x.begin() + static_cast<std::ptrdiff_t>(src), x.begin() + static_cast<std::ptrdiff_t>(src + bands * dim), in.begin() + static_cast<std::ptrdiff_t>(dst));
+        } else {
+            for (int layer = 0; layer < manifest_.depth; ++layer) {
+                std::vector<float> next(x.size());
+                for (int band_start = 0; band_start < bands; band_start += manifest_.time_batch) {
+                    const int actual = std::min(manifest_.time_batch, bands - band_start);
+                    std::vector<float> in(static_cast<std::size_t>(manifest_.time_batch * frames * dim), 0.0f);
+                    for (int local = 0; local < actual; ++local) {
+                        const int band = band_start + local;
+                        for (int t = 0; t < frames; ++t) {
+                            const std::size_t src = (static_cast<std::size_t>(t) * bands + band) * dim;
+                            const std::size_t dst = (static_cast<std::size_t>(local) * frames + t) * dim;
+                            std::copy(x.begin() + static_cast<std::ptrdiff_t>(src),
+                                      x.begin() + static_cast<std::ptrdiff_t>(src + dim),
+                                      in.begin() + static_cast<std::ptrdiff_t>(dst));
+                        }
+                    }
+                    auto out = run_transformer("layer_" + two(layer) + "_time", in, {manifest_.time_batch, frames, dim});
+                    for (int local = 0; local < actual; ++local) {
+                        const int band = band_start + local;
+                        for (int t = 0; t < frames; ++t) {
+                            const std::size_t src = (static_cast<std::size_t>(local) * frames + t) * dim;
+                            const std::size_t dst = (static_cast<std::size_t>(t) * bands + band) * dim;
+                            std::copy(out.begin() + static_cast<std::ptrdiff_t>(src),
+                                      out.begin() + static_cast<std::ptrdiff_t>(src + dim),
+                                      next.begin() + static_cast<std::ptrdiff_t>(dst));
+                        }
+                    }
                 }
-                auto out = run_transformer("layer_" + two(layer) + "_freq", in, {manifest_.freq_batch, bands, dim});
-                for (int t = 0; t < actual; ++t) {
-                    const std::size_t src = static_cast<std::size_t>(t) * bands * dim;
-                    const std::size_t dst = static_cast<std::size_t>(start + t) * bands * dim;
-                    std::copy(out.begin() + static_cast<std::ptrdiff_t>(src), out.begin() + static_cast<std::ptrdiff_t>(src + bands * dim), next.begin() + static_cast<std::ptrdiff_t>(dst));
+                x.swap(next);
+                next.assign(x.size(), 0.0f);
+                for (int start = 0; start < frames; start += manifest_.freq_batch) {
+                    const int actual = std::min(manifest_.freq_batch, frames - start);
+                    std::vector<float> in(static_cast<std::size_t>(manifest_.freq_batch * bands * dim), 0.0f);
+                    for (int t = 0; t < actual; ++t) {
+                        const std::size_t src = (static_cast<std::size_t>(start + t) * bands * dim);
+                        const std::size_t dst = static_cast<std::size_t>(t) * bands * dim;
+                        std::copy(x.begin() + static_cast<std::ptrdiff_t>(src),
+                                  x.begin() + static_cast<std::ptrdiff_t>(src + bands * dim),
+                                  in.begin() + static_cast<std::ptrdiff_t>(dst));
+                    }
+                    auto out = run_transformer("layer_" + two(layer) + "_freq", in, {manifest_.freq_batch, bands, dim});
+                    for (int t = 0; t < actual; ++t) {
+                        const std::size_t src = static_cast<std::size_t>(t) * bands * dim;
+                        const std::size_t dst = static_cast<std::size_t>(start + t) * bands * dim;
+                        std::copy(out.begin() + static_cast<std::ptrdiff_t>(src),
+                                  out.begin() + static_cast<std::ptrdiff_t>(src + bands * dim),
+                                  next.begin() + static_cast<std::ptrdiff_t>(dst));
+                    }
                 }
+                x.swap(next);
             }
-            x.swap(next);
         }
 
         const int flat_dim = std::accumulate(manifest_.dim_inputs.begin(), manifest_.dim_inputs.end(), 0);
         const int stems = stems_;
         std::vector<float> mask(static_cast<std::size_t>(stems * (flat_dim / 2) * frames * 2), 0.0f);
         if (mask_mode_ != "segm_only") {
-            int offset = 0;
-            for (int band = 0; band < bands; ++band) {
-                std::vector<float> in(static_cast<std::size_t>(frames * dim));
-                for (int t = 0; t < frames; ++t) {
-                    const std::size_t src = ((static_cast<std::size_t>(t) * bands + band) * dim);
-                    std::copy(x.begin() + static_cast<std::ptrdiff_t>(src), x.begin() + static_cast<std::ptrdiff_t>(src + dim), in.begin() + static_cast<std::ptrdiff_t>(t * dim));
-                }
-                auto out = run("mask_band_" + two(band), in, {1, frames, dim});
-                const int dim_in = manifest_.dim_inputs[band];
-                const int out_stems = static_cast<int>(out.size() / static_cast<std::size_t>(frames * dim_in));
-                for (int stem = 0; stem < out_stems; ++stem) {
+            if (manifest_.mask_group_size > 1) {
+                int offset = 0;
+                int group_index = 0;
+                for (int band_start = 0; band_start < bands; band_start += manifest_.mask_group_size, ++group_index) {
+                    const int group_count = std::min(manifest_.mask_group_size, bands - band_start);
+                    int group_dim = 0;
+                    for (int local = 0; local < group_count; ++local) {
+                        group_dim += manifest_.dim_inputs[band_start + local];
+                    }
+                    std::vector<float> in(static_cast<std::size_t>(frames * group_count * dim));
                     for (int t = 0; t < frames; ++t) {
-                        for (int d = 0; d < dim_in; ++d) {
-                            const int selected = (offset + d) / 2;
-                            const int ri = (offset + d) % 2;
-                            const std::size_t src = (static_cast<std::size_t>(stem) * frames * dim_in + static_cast<std::size_t>(t) * dim_in + d);
-                            const std::size_t dst = (((static_cast<std::size_t>(stem) * (flat_dim / 2) + selected) * frames + t) * 2 + ri);
-                            mask[dst] = out[src];
+                        for (int local = 0; local < group_count; ++local) {
+                            const int band = band_start + local;
+                            const std::size_t src = (static_cast<std::size_t>(t) * bands + band) * dim;
+                            const std::size_t dst = (static_cast<std::size_t>(t) * group_count + local) * dim;
+                            std::copy(x.begin() + static_cast<std::ptrdiff_t>(src),
+                                      x.begin() + static_cast<std::ptrdiff_t>(src + dim),
+                                      in.begin() + static_cast<std::ptrdiff_t>(dst));
                         }
                     }
+                    auto out = run("mask_group_" + two(group_index), in, {1, frames, group_count, dim});
+                    const int out_stems = static_cast<int>(out.size() / static_cast<std::size_t>(frames * group_dim));
+                    for (int stem = 0; stem < out_stems; ++stem) {
+                        for (int t = 0; t < frames; ++t) {
+                            for (int d = 0; d < group_dim; ++d) {
+                                const int selected = (offset + d) / 2;
+                                const int ri = (offset + d) % 2;
+                                const std::size_t src = (static_cast<std::size_t>(stem) * frames * group_dim + static_cast<std::size_t>(t) * group_dim + d);
+                                const std::size_t dst = (((static_cast<std::size_t>(stem) * (flat_dim / 2) + selected) * frames + t) * 2 + ri);
+                                mask[dst] = out[src];
+                            }
+                        }
+                    }
+                    offset += group_dim;
                 }
-                offset += dim_in;
+            } else {
+                int offset = 0;
+                for (int band = 0; band < bands; ++band) {
+                    std::vector<float> in(static_cast<std::size_t>(frames * dim));
+                    for (int t = 0; t < frames; ++t) {
+                        const std::size_t src = ((static_cast<std::size_t>(t) * bands + band) * dim);
+                        std::copy(x.begin() + static_cast<std::ptrdiff_t>(src), x.begin() + static_cast<std::ptrdiff_t>(src + dim), in.begin() + static_cast<std::ptrdiff_t>(t * dim));
+                    }
+                    auto out = run("mask_band_" + two(band), in, {1, frames, dim});
+                    const int dim_in = manifest_.dim_inputs[band];
+                    const int out_stems = static_cast<int>(out.size() / static_cast<std::size_t>(frames * dim_in));
+                    for (int stem = 0; stem < out_stems; ++stem) {
+                        for (int t = 0; t < frames; ++t) {
+                            for (int d = 0; d < dim_in; ++d) {
+                                const int selected = (offset + d) / 2;
+                                const int ri = (offset + d) % 2;
+                                const std::size_t src = (static_cast<std::size_t>(stem) * frames * dim_in + static_cast<std::size_t>(t) * dim_in + d);
+                                const std::size_t dst = (((static_cast<std::size_t>(stem) * (flat_dim / 2) + selected) * frames + t) * 2 + ri);
+                                mask[dst] = out[src];
+                            }
+                        }
+                    }
+                    offset += dim_in;
+                }
             }
         }
         if (mask_mode_ != "no_segm") {
@@ -612,6 +785,31 @@ private:
         return value.size() >= suffix.size() && value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
     }
 
+    static std::string profile_stage(const std::string& name) {
+        if (name == "band_split") {
+            return "band_split";
+        }
+        if (has_prefix(name, "layer_") && name.find("_time") != std::string::npos) {
+            return "time_transformer";
+        }
+        if (has_prefix(name, "layer_") && name.find("_freq") != std::string::npos) {
+            return "freq_transformer";
+        }
+        if (has_prefix(name, "block_")) {
+            return "transformer_block";
+        }
+        if (has_prefix(name, "mask_group_")) {
+            return "mask_group";
+        }
+        if (has_prefix(name, "mask_band_")) {
+            return "mask_band";
+        }
+        if (has_prefix(name, "segm_")) {
+            return "segm";
+        }
+        return "other";
+    }
+
     bool supports_split_attention_fp16() const {
         return manifest_.model_type.find("BSRoformer") != std::string::npos;
     }
@@ -635,11 +833,16 @@ private:
     }
 
     bool should_cache(const std::string& name) const {
+        if (has_prefix(name, "block_")) {
+            return segment_cache_policy_ == RoformerSegmentCachePolicy::All || segment_cache_policy_ == RoformerSegmentCachePolicy::BlocksOnly;
+        }
         switch (segment_cache_policy_) {
             case RoformerSegmentCachePolicy::All:
                 return true;
             case RoformerSegmentCachePolicy::TransformersOnly:
-                return name == "band_split" || has_prefix(name, "layer_");
+                return name == "band_split" || has_prefix(name, "layer_") || has_prefix(name, "mask_group_");
+            case RoformerSegmentCachePolicy::BlocksOnly:
+                return name == "band_split" || has_prefix(name, "block_");
             case RoformerSegmentCachePolicy::None:
                 return false;
         }
@@ -659,6 +862,9 @@ private:
         }
         if (metal_capable_backend && manifest_.attention_op == "mnn" && has_prefix(name, "layer_")) {
             // Unsplit transformer segments accumulate too much FP16 error on Metal.
+            return MNNPrecision::High;
+        }
+        if (metal_capable_backend && has_prefix(name, "block_") && precision_ != MNNPrecision::Normal) {
             return MNNPrecision::High;
         }
         const bool uses_segment_autocast = precision_policy_ == RoformerPrecisionPolicy::MetalFast ||
@@ -691,6 +897,7 @@ private:
     RoformerPrecisionPolicy precision_policy_;
     RoformerSegmentCachePolicy segment_cache_policy_;
     int threads_;
+    ProfileRecorder* profile_ = nullptr;
     std::unordered_map<std::string, mss_mnn::MNNMaskCore> runners_;
 };
 
@@ -760,34 +967,90 @@ std::vector<float> apply_mask(const std::vector<float>& stft, const std::vector<
     return out;
 }
 
-std::vector<float> separate_chunk(const std::vector<float>& chunk, int channels, const RoformerMetadata& metadata, SegmentRuntime& runtime) {
+std::vector<float> separate_chunk(const std::vector<float>& chunk,
+                                  int channels,
+                                  const RoformerMetadata& metadata,
+                                  SegmentRuntime* runtime,
+                                  MNNMaskCore* core,
+                                  ProfileRecorder* profile) {
+    auto start = Clock::now();
     auto stft = stft_roformer(chunk, channels, metadata);
+    if (profile) {
+        profile->add("dsp.stft", elapsed_ms(start));
+    }
+
+    start = Clock::now();
     const std::vector<float> mask_input = metadata.model_type == "MelBandRoformer" ? select_mbr_freqs(stft, metadata) : stft;
+    if (profile && metadata.model_type == "MelBandRoformer") {
+        profile->add("dsp.mbr_select_freqs", elapsed_ms(start));
+    }
     const int mask_freq_channels = metadata.model_type == "MelBandRoformer" ? static_cast<int>(metadata.freq_indices.size()) : metadata.output_freq_channels;
-    auto mask = runtime(mask_input, mask_freq_channels, metadata.frames);
+    std::vector<float> mask;
+    if (core) {
+        MNNRunProfile run_profile;
+        start = Clock::now();
+        mask = core->run(mask_input, {1, mask_freq_channels, metadata.frames, 2}, &run_profile);
+        if (profile) {
+            profile->add_mnn_run("core_model", run_profile);
+            profile->add("segment.core_model.wall", elapsed_ms(start));
+        }
+    } else if (runtime) {
+        mask = (*runtime)(mask_input, mask_freq_channels, metadata.frames);
+    } else {
+        throw std::runtime_error("missing RoFormer MNN runtime");
+    }
+
+    start = Clock::now();
     auto masked = apply_mask(stft, mask, metadata);
-    return istft_roformer(masked, metadata.stems, channels, static_cast<int>(chunk.size() / static_cast<std::size_t>(channels)), metadata);
+    if (profile) {
+        profile->add("dsp.apply_mask", elapsed_ms(start));
+    }
+
+    start = Clock::now();
+    auto output = istft_roformer(masked, metadata.stems, channels, static_cast<int>(chunk.size() / static_cast<std::size_t>(channels)), metadata);
+    if (profile) {
+        profile->add("dsp.istft", elapsed_ms(start));
+    }
+    return output;
 }
 
 struct RoformerSeparator::Impl {
     RoformerSeparatorOptions options;
     RoformerMetadata metadata;
     RoformerSegmentManifest manifest;
-    SegmentRuntime runtime;
+    ProfileRecorder profile;
+    std::unique_ptr<SegmentRuntime> runtime;
+    std::unique_ptr<MNNMaskCore> core;
 
     explicit Impl(RoformerSeparatorOptions opts)
         : options(std::move(opts)),
           metadata(load_roformer_metadata(options.metadata_path)),
-          manifest(load_roformer_manifest(options.segment_dir)),
-          runtime(options.segment_dir,
-                  manifest,
-                  metadata.stems,
-                  metadata.mask_mode,
-                  options.backend,
-                  options.precision,
-                  options.precision_policy,
-                  options.segment_cache_policy,
-                  options.threads) {}
+          profile(options.profile) {
+        if (!options.core_model_path.empty()) {
+            MaskCoreOptions core_options;
+            core_options.input_name = "stft_repr";
+            core_options.output_name = "mask";
+            core_options.backend = options.backend;
+            core_options.precision = options.precision;
+            core_options.threads = options.threads;
+            core = std::make_unique<MNNMaskCore>(options.core_model_path, core_options);
+        } else {
+            if (options.segment_dir.empty()) {
+                throw std::runtime_error("missing segment_dir or core_model_path");
+            }
+            manifest = load_roformer_manifest(options.segment_dir);
+            runtime = std::make_unique<SegmentRuntime>(options.segment_dir,
+                                                       manifest,
+                                                       metadata.stems,
+                                                       metadata.mask_mode,
+                                                       options.backend,
+                                                       options.precision,
+                                                       options.precision_policy,
+                                                       options.segment_cache_policy,
+                                                       options.threads,
+                                                       &profile);
+        }
+    }
 };
 
 RoformerSeparator::RoformerSeparator(RoformerSeparatorOptions options)
@@ -798,6 +1061,7 @@ RoformerSeparator::RoformerSeparator(RoformerSeparator&&) noexcept = default;
 RoformerSeparator& RoformerSeparator::operator=(RoformerSeparator&&) noexcept = default;
 
 std::vector<AudioBuffer> RoformerSeparator::separate(const AudioBuffer& audio) {
+    const auto total_start = Clock::now();
     const auto& metadata = impl_->metadata;
     if (audio.sample_rate != metadata.sample_rate) {
         throw std::runtime_error("input sample rate does not match metadata");
@@ -827,9 +1091,13 @@ std::vector<AudioBuffer> RoformerSeparator::separate(const AudioBuffer& audio) {
     std::vector<float> result(static_cast<std::size_t>(metadata.stems * audio.channels) * total, 0.0f);
     std::vector<float> counter(static_cast<std::size_t>(total), 0.0f);
     for (int start : starts) {
+        ScopedAutoreleasePool autorelease_pool;
         int valid = 0;
+        auto stage_start = Clock::now();
         auto chunk = extract_chunk(mix, audio.channels, start, metadata.chunk_size, &valid);
-        auto separated = separate_chunk(chunk, audio.channels, metadata, impl_->runtime);
+        impl_->profile.add("dsp.extract_chunk", elapsed_ms(stage_start));
+        auto separated = separate_chunk(chunk, audio.channels, metadata, impl_->runtime.get(), impl_->core.get(), &impl_->profile);
+        stage_start = Clock::now();
         auto window = chunk_window(start, total, metadata.chunk_size, fade_size, normal_window);
         for (int stem = 0; stem < metadata.stems; ++stem) {
             for (int ch = 0; ch < audio.channels; ++ch) {
@@ -843,6 +1111,7 @@ std::vector<AudioBuffer> RoformerSeparator::separate(const AudioBuffer& audio) {
         for (int i = 0; i < valid; ++i) {
             counter[static_cast<std::size_t>(start + i)] += window[static_cast<std::size_t>(i)];
         }
+        impl_->profile.add("dsp.overlap_add", elapsed_ms(stage_start));
     }
 
     int crop_start = 0;
@@ -867,6 +1136,8 @@ std::vector<AudioBuffer> RoformerSeparator::separate(const AudioBuffer& audio) {
             }
         }
     }
+    impl_->profile.add("total.separate", elapsed_ms(total_start));
+    impl_->profile.print(std::cerr);
     return outputs;
 }
 

@@ -5,6 +5,7 @@ import argparse
 import json
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import MNN.expr as F
@@ -15,7 +16,18 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from tools.mnn_export.presets import default_out_dir, get_preset, preset_names  # noqa: E402
-from tools.mnn_export.roformer_expr_ops import band_split, mask_band, transformer, transformer_attention_block, transformer_ffn_block  # noqa: E402
+from tools.mnn_export.roformer_expr_ops import (  # noqa: E402
+    band_split,
+    const_cache,
+    mask_band,
+    mask_band_group,
+    roformer_block,
+    roformer_block_grouped,
+    roformer_block_unrolled,
+    transformer,
+    transformer_attention_block,
+    transformer_ffn_block,
+)
 from tools.mnn_export.roformer_mnn import build_separator, prepare_model_for_export, run_mnnconvert, write_metadata  # noqa: E402
 
 
@@ -53,8 +65,12 @@ def build_manifest(
     segm_output_shape,
     attention_op,
     transformer_split,
+    transformer_block_size,
+    transformer_block_mode,
+    transformer_block_time_group_size,
 ):
     mask_mode = str(getattr(model, "mask_mode", preset.mask_mode))
+    transformer_block_size = max(0, int(transformer_block_size))
     return {
         "preset": preset.name,
         "model_type": type(model).__name__,
@@ -74,8 +90,13 @@ def build_manifest(
         "dim_inputs": list(model.band_split.dim_inputs),
         "time_batch": time_batch,
         "freq_batch": freq_batch,
+        "mask_group_size": max(1, int(getattr(model, "_pymss_mnn_mask_group_size", 1))),
         "attention_op": attention_op,
         "transformer_split": transformer_split,
+        "transformer_block_size": transformer_block_size,
+        "transformer_block_count": (len(model.layers) + transformer_block_size - 1) // transformer_block_size if transformer_block_size else 0,
+        "transformer_block_mode": transformer_block_mode if transformer_block_size else "",
+        "transformer_block_time_group_size": int(transformer_block_time_group_size) if transformer_block_size else 0,
     }
 
 
@@ -87,9 +108,20 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Export low-memory MNN expr segments for RoFormer inference.")
     parser.add_argument("--preset", required=True, help=f"Preset name: {preset_names()}")
     parser.add_argument("--out-dir", type=Path, default=default_out_dir())
-    parser.add_argument("--time-batch", type=int, default=1)
+    parser.add_argument(
+        "--time-batch",
+        type=int,
+        default=1,
+        help="Batch independent time-transformer band sequences. Keep 1 for validated Metal exports.",
+    )
     parser.add_argument("--freq-batch", type=int, default=16)
     parser.add_argument("--only", choices=("all", "transformers", "mask_bands", "segm", "manifest"), default="all")
+    parser.add_argument(
+        "--mask-group-size",
+        type=int,
+        default=1,
+        help="Export mask estimators in groups of N bands to reduce runtime sessions. 1 keeps the lowest-memory per-band layout.",
+    )
     parser.add_argument(
         "--attention-op",
         choices=("manual", "mnn"),
@@ -102,7 +134,70 @@ def parse_args():
         default="fused",
         help="Export each transformer as one segment or split it into attention and FFN segments for segment-level precision control.",
     )
+    parser.add_argument(
+        "--transformer-block-size",
+        type=int,
+        default=0,
+        help="Export whole RoFormer layer blocks as MNN Expr segments. 0 keeps legacy per time/freq transformer segments.",
+    )
+    parser.add_argument(
+        "--transformer-block-mode",
+        choices=("grouped", "batched", "unrolled"),
+        default="batched",
+        help="batched is the validated block default; grouped/unrolled are diagnostic fallbacks and can create much larger graphs.",
+    )
+    parser.add_argument(
+        "--transformer-block-time-group-size",
+        type=int,
+        default=8,
+        help="Band group size for --transformer-block-mode grouped. Lower values reduce peak memory and increase graph size.",
+    )
+    parser.add_argument("--convert-timeout", type=int, default=2400)
+    parser.add_argument(
+        "--frames",
+        type=int,
+        default=None,
+        help="Override the fixed MNN STFT frame count for a mobile/lower-memory export.",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=None,
+        help="Override metadata/inference chunk size. If --frames is omitted, frames are derived from this value.",
+    )
+    parser.add_argument("--overlap-size", type=int, default=None, help="Override metadata/inference overlap size.")
+    parser.add_argument("--variant-name", default=None, help="Output preset name for custom shape exports.")
     return parser.parse_args()
+
+
+def apply_shape_overrides(preset, args):
+    if args.frames is None and args.chunk_size is None and args.overlap_size is None and args.variant_name is None:
+        return preset
+    base_frames = int(preset.input_shape[2])
+    if base_frames <= 1:
+        raise ValueError(f"cannot infer hop length from input_shape {preset.input_shape}")
+    hop_length = max(1, int(round(preset.chunk_size / float(base_frames - 1))))
+    frames = int(args.frames) if args.frames is not None else int(args.chunk_size) // hop_length + 1
+    if frames <= 1:
+        raise ValueError("--frames must be > 1")
+    chunk_size = int(args.chunk_size) if args.chunk_size is not None else (frames - 1) * hop_length
+    if chunk_size <= 0:
+        raise ValueError("--chunk-size must be > 0")
+    if args.overlap_size is not None:
+        overlap_size = int(args.overlap_size)
+    else:
+        overlap_ratio = preset.overlap_size / float(max(1, preset.chunk_size))
+        overlap_size = int(round(chunk_size * overlap_ratio))
+    overlap_size = max(0, min(overlap_size, chunk_size - 1))
+    batch, freq_channels, _, complex_dim = preset.input_shape
+    variant_name = args.variant_name or f"{preset.name}_f{frames}"
+    return replace(
+        preset,
+        name=variant_name,
+        chunk_size=chunk_size,
+        overlap_size=overlap_size,
+        input_shape=(batch, freq_channels, frames, complex_dim),
+    )
 
 
 def translate_json_ops(path: Path) -> None:
@@ -163,6 +258,41 @@ def export_mask_band(model, band_index: int, shape, path: Path):
     return list(y.shape)
 
 
+def export_mask_group(model, band_start: int, band_count: int, shape, path: Path):
+    x = F.placeholder(list(shape), F.NCHW, F.float)
+    x.name = "input"
+    y = mask_band_group(model, band_start, band_count, x)
+    save_var(y, path)
+    return list(y.shape)
+
+
+def export_transformer_block(
+    model,
+    start_layer: int,
+    end_layer: int,
+    shape,
+    path: Path,
+    *,
+    freq_batch: int,
+    time_group_size: int,
+    attention_op: str,
+    mode: str,
+):
+    x = F.placeholder(list(shape), F.NCHW, F.float)
+    x.name = "input"
+    with const_cache():
+        if mode == "grouped":
+            y = roformer_block_grouped(model, start_layer, end_layer, x, time_group_size=time_group_size, attention_op=attention_op)
+        elif mode == "batched":
+            y = roformer_block(model, start_layer, end_layer, x, attention_op=attention_op)
+        elif mode == "unrolled":
+            y = roformer_block_unrolled(model, start_layer, end_layer, x, freq_batch=freq_batch, attention_op=attention_op)
+        else:
+            raise ValueError(f"unsupported transformer block mode: {mode}")
+    save_var(y, path, translate_json=attention_op == "mnn")
+    return list(y.shape)
+
+
 def export_segm(model, stem_index: int, shape, out_dir: Path):
     wrapper = SegmWrapper(model.final_norm, model.mask_estimators[stem_index]).eval()
     x = torch.zeros(*shape, dtype=torch.float32)
@@ -186,17 +316,26 @@ def export_segm(model, stem_index: int, shape, out_dir: Path):
 
 def main() -> None:
     args = parse_args()
-    preset = get_preset(args.preset)
+    preset = apply_shape_overrides(get_preset(args.preset), args)
     out_dir = args.out_dir / preset.name / "expr_micro_segments"
     separator = build_separator(preset, batch_size=preset.input_shape[0], device="cpu")
     model = prepare_model_for_export(separator.model.cpu())
     mask_mode = str(getattr(model, "mask_mode", preset.mask_mode))
     if preset.input_shape[0] != 1:
         raise ValueError("HyperACE segm MNN export is validated with batch_size=1 only")
-    if args.attention_op == "mnn" and (args.time_batch != 1 or args.freq_batch != 1):
+    if args.attention_op == "mnn" and not args.transformer_block_size and (args.time_batch != 1 or args.freq_batch != 1):
         raise ValueError("MNN Attention export currently requires --time-batch 1 --freq-batch 1")
     if args.transformer_split == "attention_ffn" and args.attention_op != "mnn":
         raise ValueError("--transformer-split attention_ffn is intended for --attention-op mnn")
+    if args.transformer_block_size < 0:
+        raise ValueError("--transformer-block-size must be >= 0")
+    if args.transformer_block_size and args.transformer_split != "fused":
+        raise ValueError("--transformer-block-size exports whole blocks and cannot be combined with --transformer-split attention_ffn")
+    if args.transformer_block_time_group_size < 1:
+        raise ValueError("--transformer-block-time-group-size must be >= 1")
+    if args.mask_group_size < 1:
+        raise ValueError("--mask-group-size must be >= 1")
+    model._pymss_mnn_mask_group_size = int(args.mask_group_size)
 
     batch, freq_channels, frames, complex_dim = preset.input_shape
     bands = len(model.band_split.dim_inputs)
@@ -228,6 +367,9 @@ def main() -> None:
             segm_output_shape=segm_output_shape,
             attention_op=args.attention_op,
             transformer_split=args.transformer_split,
+            transformer_block_size=args.transformer_block_size,
+            transformer_block_mode=args.transformer_block_mode,
+            transformer_block_time_group_size=args.transformer_block_time_group_size,
         )
         write_metadata(out_dir.parent / f"{preset.name}_metadata.json", preset, separator, tuple(mask_shape), compact=False)
         (out_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -246,76 +388,127 @@ def main() -> None:
         exported.append({"name": name, "path": str(dst), "input_shape": list(x.shape), "output_shape": list(y.shape)})
 
     if args.only in ("all", "transformers"):
-        for layer_index, (time_transformer, freq_transformer) in enumerate(model.layers):
-            name = f"layer_{layer_index:02d}_time"
-            if args.transformer_split == "attention_ffn":
-                output_shape = export_transformer_split(
-                    time_transformer,
-                    time_shape,
-                    out_dir / name,
+        if args.transformer_block_size:
+            block_index = 0
+            for start_layer in range(0, len(model.layers), args.transformer_block_size):
+                end_layer = min(start_layer + args.transformer_block_size, len(model.layers))
+                name = f"block_{block_index:02d}"
+                output_shape = export_transformer_block(
+                    model,
+                    start_layer,
+                    end_layer,
+                    band_shape,
+                    out_dir / f"{name}.mnn",
+                    freq_batch=args.freq_batch,
+                    time_group_size=args.transformer_block_time_group_size,
                     attention_op=args.attention_op,
+                    mode=args.transformer_block_mode,
                 )
-                exported.extend(
-                    [
-                        {"name": f"{name}_attn", "path": str(out_dir / f"{name}_attn.mnn"), "input_shape": time_shape, "output_shape": output_shape},
-                        {"name": f"{name}_ffn", "path": str(out_dir / f"{name}_ffn.mnn"), "input_shape": time_shape, "output_shape": output_shape},
-                    ]
-                )
-            else:
                 exported.append(
                     {
                         "name": name,
                         "path": str(out_dir / f"{name}.mnn"),
-                        "input_shape": time_shape,
-                        "output_shape": export_transformer(
-                            time_transformer,
-                            time_shape,
-                            out_dir / f"{name}.mnn",
-                            attention_op=args.attention_op,
-                        ),
+                        "input_shape": band_shape,
+                        "output_shape": output_shape,
+                        "start_layer": start_layer,
+                        "end_layer": end_layer,
                     }
                 )
-            name = f"layer_{layer_index:02d}_freq"
-            if args.transformer_split == "attention_ffn":
-                output_shape = export_transformer_split(
-                    freq_transformer,
-                    freq_shape,
-                    out_dir / name,
-                    attention_op=args.attention_op,
-                )
-                exported.extend(
-                    [
-                        {"name": f"{name}_attn", "path": str(out_dir / f"{name}_attn.mnn"), "input_shape": freq_shape, "output_shape": output_shape},
-                        {"name": f"{name}_ffn", "path": str(out_dir / f"{name}_ffn.mnn"), "input_shape": freq_shape, "output_shape": output_shape},
-                    ]
-                )
-            else:
-                exported.append(
-                    {
-                        "name": name,
-                        "path": str(out_dir / f"{name}.mnn"),
-                        "input_shape": freq_shape,
-                        "output_shape": export_transformer(
-                            freq_transformer,
-                            freq_shape,
-                            out_dir / f"{name}.mnn",
-                            attention_op=args.attention_op,
-                        ),
-                    }
-                )
+                block_index += 1
+        else:
+            for layer_index, (time_transformer, freq_transformer) in enumerate(model.layers):
+                name = f"layer_{layer_index:02d}_time"
+                if args.transformer_split == "attention_ffn":
+                    output_shape = export_transformer_split(
+                        time_transformer,
+                        time_shape,
+                        out_dir / name,
+                        attention_op=args.attention_op,
+                    )
+                    exported.extend(
+                        [
+                            {"name": f"{name}_attn", "path": str(out_dir / f"{name}_attn.mnn"), "input_shape": time_shape, "output_shape": output_shape},
+                            {"name": f"{name}_ffn", "path": str(out_dir / f"{name}_ffn.mnn"), "input_shape": time_shape, "output_shape": output_shape},
+                        ]
+                    )
+                else:
+                    exported.append(
+                        {
+                            "name": name,
+                            "path": str(out_dir / f"{name}.mnn"),
+                            "input_shape": time_shape,
+                            "output_shape": export_transformer(
+                                time_transformer,
+                                time_shape,
+                                out_dir / f"{name}.mnn",
+                                attention_op=args.attention_op,
+                            ),
+                        }
+                    )
+                name = f"layer_{layer_index:02d}_freq"
+                if args.transformer_split == "attention_ffn":
+                    output_shape = export_transformer_split(
+                        freq_transformer,
+                        freq_shape,
+                        out_dir / name,
+                        attention_op=args.attention_op,
+                    )
+                    exported.extend(
+                        [
+                            {"name": f"{name}_attn", "path": str(out_dir / f"{name}_attn.mnn"), "input_shape": freq_shape, "output_shape": output_shape},
+                            {"name": f"{name}_ffn", "path": str(out_dir / f"{name}_ffn.mnn"), "input_shape": freq_shape, "output_shape": output_shape},
+                        ]
+                    )
+                else:
+                    exported.append(
+                        {
+                            "name": name,
+                            "path": str(out_dir / f"{name}.mnn"),
+                            "input_shape": freq_shape,
+                            "output_shape": export_transformer(
+                                freq_transformer,
+                                freq_shape,
+                                out_dir / f"{name}.mnn",
+                                attention_op=args.attention_op,
+                            ),
+                        }
+                    )
 
     if args.only in ("all", "mask_bands") and mask_mode != "segm_only":
-        for band_index, dim_input in enumerate(model.band_split.dim_inputs):
-            name = f"mask_band_{band_index:02d}"
-            exported.append(
-                {
-                    "name": name,
-                    "path": str(out_dir / f"{name}.mnn"),
-                    "input_shape": [batch, frames, dim],
-                    "output_shape": export_mask_band(model, band_index, [batch, frames, dim], out_dir / f"{name}.mnn"),
-                    "dim_input": int(dim_input),
-                }
-            )
+        if args.mask_group_size == 1:
+            for band_index, dim_input in enumerate(model.band_split.dim_inputs):
+                name = f"mask_band_{band_index:02d}"
+                exported.append(
+                    {
+                        "name": name,
+                        "path": str(out_dir / f"{name}.mnn"),
+                        "input_shape": [batch, frames, dim],
+                        "output_shape": export_mask_band(model, band_index, [batch, frames, dim], out_dir / f"{name}.mnn"),
+                        "dim_input": int(dim_input),
+                    }
+                )
+        else:
+            for group_index, band_start in enumerate(range(0, bands, args.mask_group_size)):
+                band_count = min(args.mask_group_size, bands - band_start)
+                name = f"mask_group_{group_index:02d}"
+                dim_inputs = [int(value) for value in model.band_split.dim_inputs[band_start : band_start + band_count]]
+                exported.append(
+                    {
+                        "name": name,
+                        "path": str(out_dir / f"{name}.mnn"),
+                        "input_shape": [batch, frames, band_count, dim],
+                        "output_shape": export_mask_group(
+                            model,
+                            band_start,
+                            band_count,
+                            [batch, frames, band_count, dim],
+                            out_dir / f"{name}.mnn",
+                        ),
+                        "band_start": band_start,
+                        "band_count": band_count,
+                        "dim_inputs": dim_inputs,
+                    }
+                )
 
     if args.only in ("all", "segm") and has_hyperace_segm(model) and mask_mode != "no_segm":
         for stem_index in range(len(model.mask_estimators)):
@@ -348,6 +541,9 @@ def main() -> None:
         segm_output_shape=segm_output_shape,
         attention_op=args.attention_op,
         transformer_split=args.transformer_split,
+        transformer_block_size=args.transformer_block_size,
+        transformer_block_mode=args.transformer_block_mode,
+        transformer_block_time_group_size=args.transformer_block_time_group_size,
     )
     (out_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(manifest, ensure_ascii=False, indent=2))

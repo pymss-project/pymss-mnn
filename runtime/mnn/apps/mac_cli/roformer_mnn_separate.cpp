@@ -11,6 +11,7 @@ namespace {
 struct Args {
     std::string preset;
     std::string segment_dir;
+    std::string core_model;
     std::string metadata;
     std::string input_wav;
     std::string output_dir;
@@ -19,15 +20,16 @@ struct Args {
     mss_mnn::RoformerPrecisionPolicy precision_policy = mss_mnn::RoformerPrecisionPolicy::MetalFast;
     mss_mnn::RoformerSegmentCachePolicy segment_cache_policy = mss_mnn::RoformerSegmentCachePolicy::TransformersOnly;
     int threads = 1;
+    bool profile = false;
 };
 
 void usage(const char* argv0) {
     std::cerr
-        << "Usage: " << argv0 << " --preset bsr_hyperace_voc --segments dir --metadata file.json "
+        << "Usage: " << argv0 << " --preset bsr_hyperace_voc (--segments dir | --core-model model.mnn) --metadata file.json "
         << "--input input.wav --output-dir out [--backend cpu|auto|metal|opencl|vulkan] "
         << "[--precision auto|normal|high|low|low-bf16] "
         << "[--precision-policy uniform|metal-fast|metal-autocast] "
-        << "[--segment-cache all|transformers|none] [--threads 1]\n";
+        << "[--segment-cache all|transformers|blocks|none] [--threads 1] [--profile]\n";
 }
 
 Args parse_args(int argc, char** argv) {
@@ -44,6 +46,8 @@ Args parse_args(int argc, char** argv) {
             args.preset = require_value(key);
         } else if (key == "--segments") {
             args.segment_dir = require_value(key);
+        } else if (key == "--core-model") {
+            args.core_model = require_value(key);
         } else if (key == "--metadata") {
             args.metadata = require_value(key);
         } else if (key == "--input") {
@@ -60,6 +64,8 @@ Args parse_args(int argc, char** argv) {
             args.segment_cache_policy = mss_mnn::roformer_segment_cache_policy_from_name(require_value(key));
         } else if (key == "--threads") {
             args.threads = std::stoi(require_value(key));
+        } else if (key == "--profile") {
+            args.profile = true;
         } else if (key == "--help" || key == "-h") {
             usage(argv[0]);
             std::exit(0);
@@ -67,8 +73,11 @@ Args parse_args(int argc, char** argv) {
             throw std::runtime_error("unknown option: " + key);
         }
     }
-    if (args.preset.empty() || args.segment_dir.empty() || args.metadata.empty() || args.input_wav.empty() || args.output_dir.empty()) {
+    if (args.preset.empty() || args.metadata.empty() || args.input_wav.empty() || args.output_dir.empty()) {
         throw std::runtime_error("missing required arguments");
+    }
+    if (args.segment_dir.empty() == args.core_model.empty()) {
+        throw std::runtime_error("provide exactly one of --segments or --core-model");
     }
     return args;
 }
@@ -85,12 +94,14 @@ int main(int argc, char** argv) {
         const Args args = parse_args(argc, argv);
         mss_mnn::RoformerSeparatorOptions options;
         options.segment_dir = args.segment_dir;
+        options.core_model_path = args.core_model;
         options.metadata_path = args.metadata;
         options.backend = args.backend;
         options.precision = args.precision;
         options.precision_policy = args.precision_policy;
         options.segment_cache_policy = args.segment_cache_policy;
         options.threads = args.threads;
+        options.profile = args.profile;
 
         mss_mnn::RoformerSeparator separator(options);
         const auto input = mss_mnn::read_wav(args.input_wav);

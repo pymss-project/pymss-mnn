@@ -1,10 +1,13 @@
 #include "mss_mnn/mnn_mask_core.hpp"
 
+#include "apple_autorelease_pool.hpp"
+
 #include <MNN/Interpreter.hpp>
 #include <MNN/Tensor.hpp>
 
 #include <fstream>
 #include <algorithm>
+#include <chrono>
 #include <cctype>
 #include <numeric>
 #include <sstream>
@@ -12,6 +15,11 @@
 
 namespace mss_mnn {
 namespace {
+
+double elapsed_ms(std::chrono::steady_clock::time_point start) {
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    return std::chrono::duration<double, std::milli>(elapsed).count();
+}
 
 MNNForwardType backend_type(MNNBackend backend) {
     switch (backend) {
@@ -61,13 +69,20 @@ struct MNNMaskCore::Impl {
     MaskCoreOptions options;
     std::shared_ptr<MNN::Interpreter> interpreter;
     MNN::Session* session = nullptr;
+    std::vector<int> input_shape;
     std::vector<int> output_shape;
+};
+
+struct InputMetadata {
+    std::string name;
+    std::vector<int> shape;
 };
 
 struct MNNModel::Impl {
     MNNModelOptions options;
     std::shared_ptr<MNN::Interpreter> interpreter;
     MNN::Session* session = nullptr;
+    std::vector<InputMetadata> input_metadata;
 };
 
 MNNBackend mnn_backend_from_name(const std::string& name) {
@@ -150,6 +165,7 @@ std::string mnn_precision_name(MNNPrecision precision) {
 
 MNNModel::MNNModel(const std::string& model_path, MNNModelOptions options)
     : impl_(std::make_unique<Impl>()) {
+    ScopedAutoreleasePool autorelease_pool;
     impl_->options = std::move(options);
     impl_->interpreter.reset(MNN::Interpreter::createFromFile(model_path.c_str()));
     if (!impl_->interpreter) {
@@ -174,6 +190,7 @@ MNNModel::MNNModel(MNNModel&&) noexcept = default;
 MNNModel& MNNModel::operator=(MNNModel&&) noexcept = default;
 
 std::vector<MNNTensor> MNNModel::run(const std::vector<MNNTensor>& inputs, const std::vector<std::string>& output_names) {
+    ScopedAutoreleasePool autorelease_pool;
     if (inputs.empty()) {
         throw std::runtime_error("MNNModel::run requires at least one input");
     }
@@ -181,7 +198,12 @@ std::vector<MNNTensor> MNNModel::run(const std::vector<MNNTensor>& inputs, const
         throw std::runtime_error("MNNModel::run requires at least one output name");
     }
 
-    for (const auto& input : inputs) {
+    bool needs_resize = impl_->input_metadata.size() != inputs.size();
+    if (needs_resize) {
+        impl_->input_metadata.resize(inputs.size());
+    }
+    for (std::size_t i = 0; i < inputs.size(); ++i) {
+        const auto& input = inputs[i];
         if (input.data.size() != shape_element_count(input.shape)) {
             throw std::runtime_error("input size does not match input shape: " + input.name);
         }
@@ -189,9 +211,16 @@ std::vector<MNNTensor> MNNModel::run(const std::vector<MNNTensor>& inputs, const
         if (!input_tensor) {
             throw std::runtime_error("missing MNN input tensor: " + input.name);
         }
-        impl_->interpreter->resizeTensor(input_tensor, input.shape);
+        if (needs_resize || impl_->input_metadata[i].name != input.name || impl_->input_metadata[i].shape != input.shape) {
+            impl_->interpreter->resizeTensor(input_tensor, input.shape);
+            impl_->input_metadata[i].name = input.name;
+            impl_->input_metadata[i].shape = input.shape;
+            needs_resize = true;
+        }
     }
-    impl_->interpreter->resizeSession(impl_->session);
+    if (needs_resize) {
+        impl_->interpreter->resizeSession(impl_->session);
+    }
 
     for (const auto& input : inputs) {
         auto* input_tensor = impl_->interpreter->getSessionInput(impl_->session, input.name.c_str());
@@ -227,6 +256,7 @@ std::vector<MNNTensor> MNNModel::run(const std::vector<MNNTensor>& inputs, const
 
 MNNMaskCore::MNNMaskCore(const std::string& model_path, MaskCoreOptions options)
     : impl_(std::make_unique<Impl>()) {
+    ScopedAutoreleasePool autorelease_pool;
     impl_->options = std::move(options);
     impl_->interpreter.reset(MNN::Interpreter::createFromFile(model_path.c_str()));
     if (!impl_->interpreter) {
@@ -250,27 +280,41 @@ MNNMaskCore::~MNNMaskCore() = default;
 MNNMaskCore::MNNMaskCore(MNNMaskCore&&) noexcept = default;
 MNNMaskCore& MNNMaskCore::operator=(MNNMaskCore&&) noexcept = default;
 
-std::vector<float> MNNMaskCore::run(const std::vector<float>& input, const std::vector<int>& input_shape) {
+std::vector<float> MNNMaskCore::run(const std::vector<float>& input, const std::vector<int>& input_shape, MNNRunProfile* profile) {
+    ScopedAutoreleasePool autorelease_pool;
     if (input.size() != shape_element_count(input_shape)) {
         throw std::runtime_error("input size does not match input shape");
     }
+    MNNRunProfile local_profile;
 
     auto* input_tensor = impl_->interpreter->getSessionInput(impl_->session, impl_->options.input_name.c_str());
     if (!input_tensor) {
         throw std::runtime_error("missing MNN input tensor: " + impl_->options.input_name);
     }
-    impl_->interpreter->resizeTensor(input_tensor, input_shape);
-    impl_->interpreter->resizeSession(impl_->session);
+    if (impl_->input_shape != input_shape) {
+        const auto start = std::chrono::steady_clock::now();
+        impl_->interpreter->resizeTensor(input_tensor, input_shape);
+        impl_->interpreter->resizeSession(impl_->session);
+        impl_->input_shape = input_shape;
+        local_profile.resize_ms += elapsed_ms(start);
+    }
 
-    MNN::Tensor host_input(input_tensor, input_tensor->getDimensionType());
-    std::copy(input.begin(), input.end(), host_input.host<float>());
-    input_tensor->copyFromHostTensor(&host_input);
+    {
+        const auto start = std::chrono::steady_clock::now();
+        MNN::Tensor host_input(input_tensor, input_tensor->getDimensionType());
+        std::copy(input.begin(), input.end(), host_input.host<float>());
+        input_tensor->copyFromHostTensor(&host_input);
+        local_profile.input_copy_ms += elapsed_ms(start);
+    }
 
+    const auto run_start = std::chrono::steady_clock::now();
     auto code = impl_->interpreter->runSession(impl_->session);
+    local_profile.run_ms += elapsed_ms(run_start);
     if (code != 0) {
         throw std::runtime_error("MNN runSession failed");
     }
 
+    const auto output_start = std::chrono::steady_clock::now();
     auto* output_tensor = impl_->interpreter->getSessionOutput(impl_->session, impl_->options.output_name.c_str());
     if (!output_tensor) {
         throw std::runtime_error("missing MNN output tensor: " + impl_->options.output_name);
@@ -281,7 +325,12 @@ std::vector<float> MNNMaskCore::run(const std::vector<float>& input, const std::
 
     const auto count = shape_element_count(impl_->output_shape);
     const float* ptr = host_output.host<float>();
-    return std::vector<float>(ptr, ptr + count);
+    std::vector<float> output(ptr, ptr + count);
+    local_profile.output_copy_ms += elapsed_ms(output_start);
+    if (profile) {
+        *profile = local_profile;
+    }
+    return output;
 }
 
 const std::vector<int>& MNNMaskCore::output_shape() const {
