@@ -15,13 +15,15 @@ struct Args {
     std::string input_name = "stft_repr";
     std::string output_name = "mask";
     mss_mnn::MNNBackend backend = mss_mnn::MNNBackend::CPU;
+    mss_mnn::MNNPrecision precision = mss_mnn::MNNPrecision::Auto;
     int threads = 1;
 };
 
 void usage(const char* argv0) {
     std::cerr
         << "Usage: " << argv0 << " --model model.mnn --input input.f32 --shape 1,2050,938,2 --output out.f32\n"
-        << "Optional: --input-name stft_repr --output-name mask --backend cpu|auto|metal|opencl|vulkan --threads 1\n";
+        << "Optional: --input-name stft_repr --output-name mask --backend cpu|auto|metal|opencl|vulkan "
+        << "--precision auto|normal|high|low|low-bf16 --threads 1\n";
 }
 
 Args parse_args(int argc, char** argv) {
@@ -48,6 +50,8 @@ Args parse_args(int argc, char** argv) {
             args.output_name = require_value(key);
         } else if (key == "--backend") {
             args.backend = mss_mnn::mnn_backend_from_name(require_value(key));
+        } else if (key == "--precision") {
+            args.precision = mss_mnn::mnn_precision_from_name(require_value(key));
         } else if (key == "--threads") {
             args.threads = std::stoi(require_value(key));
         } else if (key == "--help" || key == "-h") {
@@ -72,6 +76,7 @@ int main(int argc, char** argv) {
         options.input_name = args.input_name;
         options.output_name = args.output_name;
         options.backend = args.backend;
+        options.precision = args.precision;
         options.threads = args.threads;
 
         mss_mnn::MNNMaskCore core(args.model, options);

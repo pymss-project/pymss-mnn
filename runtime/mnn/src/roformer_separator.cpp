@@ -200,6 +200,7 @@ RoformerSegmentManifest load_roformer_manifest(const std::string& segment_dir) {
     manifest.num_bands = json_int(text, "num_bands");
     manifest.time_batch = json_int(text, "time_batch");
     manifest.freq_batch = json_int(text, "freq_batch");
+    manifest.attention_op = json_string_or_default(text, "attention_op", "manual");
     manifest.dim_inputs = json_int_array(text, "dim_inputs");
     const auto band_shape = json_int_array(text, "band_shape");
     if (band_shape.size() != 4) {
@@ -207,6 +208,64 @@ RoformerSegmentManifest load_roformer_manifest(const std::string& segment_dir) {
     }
     manifest.dim = band_shape[3];
     return manifest;
+}
+
+RoformerPrecisionPolicy roformer_precision_policy_from_name(const std::string& name) {
+    std::string value = name;
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (value == "uniform") {
+        return RoformerPrecisionPolicy::Uniform;
+    }
+    if (value == "metal-fast" || value == "fast" || value == "mobile-fast") {
+        return RoformerPrecisionPolicy::MetalFast;
+    }
+    if (value == "metal-autocast" || value == "autocast" || value == "metal-balanced" || value == "balanced") {
+        return RoformerPrecisionPolicy::MetalAutocast;
+    }
+    throw std::runtime_error("unknown RoFormer precision policy: " + name);
+}
+
+std::string roformer_precision_policy_name(RoformerPrecisionPolicy policy) {
+    switch (policy) {
+        case RoformerPrecisionPolicy::Uniform:
+            return "uniform";
+        case RoformerPrecisionPolicy::MetalFast:
+            return "metal-fast";
+        case RoformerPrecisionPolicy::MetalAutocast:
+            return "metal-autocast";
+    }
+    return "uniform";
+}
+
+RoformerSegmentCachePolicy roformer_segment_cache_policy_from_name(const std::string& name) {
+    std::string value = name;
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (value == "all") {
+        return RoformerSegmentCachePolicy::All;
+    }
+    if (value == "transformers" || value == "transformer" || value == "core") {
+        return RoformerSegmentCachePolicy::TransformersOnly;
+    }
+    if (value == "none" || value == "off" || value == "no-cache") {
+        return RoformerSegmentCachePolicy::None;
+    }
+    throw std::runtime_error("unknown RoFormer segment cache policy: " + name);
+}
+
+std::string roformer_segment_cache_policy_name(RoformerSegmentCachePolicy policy) {
+    switch (policy) {
+        case RoformerSegmentCachePolicy::All:
+            return "all";
+        case RoformerSegmentCachePolicy::TransformersOnly:
+            return "transformers";
+        case RoformerSegmentCachePolicy::None:
+            return "none";
+    }
+    return "all";
 }
 
 std::vector<float> hann_window(int size) {
@@ -417,18 +476,32 @@ std::vector<float> chunk_window(int start, int total_length, int chunk_size, int
 
 class SegmentRuntime {
 public:
-    SegmentRuntime(std::string segment_dir, const RoformerSegmentManifest& manifest, int stems, std::string mask_mode, MNNBackend backend, int threads)
-        : segment_dir_(std::move(segment_dir)), manifest_(manifest), stems_(stems), mask_mode_(std::move(mask_mode)), backend_(backend), threads_(threads) {}
+    SegmentRuntime(std::string segment_dir,
+                   const RoformerSegmentManifest& manifest,
+                   int stems,
+                   std::string mask_mode,
+                   MNNBackend backend,
+                   MNNPrecision precision,
+                   RoformerPrecisionPolicy precision_policy,
+                   RoformerSegmentCachePolicy segment_cache_policy,
+                   int threads)
+        : segment_dir_(std::move(segment_dir)),
+          manifest_(manifest),
+          stems_(stems),
+          mask_mode_(std::move(mask_mode)),
+          backend_(backend),
+          precision_(precision),
+          precision_policy_(precision_policy),
+          segment_cache_policy_(segment_cache_policy),
+          threads_(threads) {}
 
     std::vector<float> run(const std::string& name, const std::vector<float>& input, const std::vector<int>& shape) {
+        if (!should_cache(name)) {
+            return create_runner(name).run(input, shape);
+        }
         auto it = runners_.find(name);
         if (it == runners_.end()) {
-            mss_mnn::MaskCoreOptions options;
-            options.input_name = "input";
-            options.output_name = "output";
-            options.backend = backend_;
-            options.threads = threads_;
-            it = runners_.emplace(name, mss_mnn::MNNMaskCore(segment_dir_ + "/" + name + ".mnn", options)).first;
+            it = runners_.emplace(name, create_runner(name)).first;
         }
         return it->second.run(input, shape);
     }
@@ -528,11 +601,68 @@ private:
         return value < 10 ? "0" + std::to_string(value) : std::to_string(value);
     }
 
+    static bool has_prefix(const std::string& value, const std::string& prefix) {
+        return value.rfind(prefix, 0) == 0;
+    }
+
+    mss_mnn::MNNMaskCore create_runner(const std::string& name) const {
+        mss_mnn::MaskCoreOptions options;
+        options.input_name = "input";
+        options.output_name = "output";
+        options.backend = backend_;
+        options.precision = segment_precision(name);
+        options.threads = threads_;
+        options.attention_option = segment_attention_option(name);
+        return mss_mnn::MNNMaskCore(segment_dir_ + "/" + name + ".mnn", options);
+    }
+
+    bool should_cache(const std::string& name) const {
+        switch (segment_cache_policy_) {
+            case RoformerSegmentCachePolicy::All:
+                return true;
+            case RoformerSegmentCachePolicy::TransformersOnly:
+                return name == "band_split" || has_prefix(name, "layer_");
+            case RoformerSegmentCachePolicy::None:
+                return false;
+        }
+        return true;
+    }
+
+    MNNPrecision segment_precision(const std::string& name) const {
+        const bool metal_capable_backend = backend_ == MNNBackend::Metal || backend_ == MNNBackend::Auto;
+        if (metal_capable_backend && manifest_.attention_op == "mnn" && has_prefix(name, "layer_")) {
+            // Metal FP16 Attention is not reliable with RoFormer's explicit add mask.
+            return MNNPrecision::High;
+        }
+        const bool uses_segment_autocast = precision_policy_ == RoformerPrecisionPolicy::MetalFast ||
+                                           precision_policy_ == RoformerPrecisionPolicy::MetalAutocast;
+        if (!uses_segment_autocast || !metal_capable_backend || precision_ != MNNPrecision::Auto) {
+            return precision_;
+        }
+        if (name == "band_split") {
+            return MNNPrecision::High;
+        }
+        if (precision_policy_ == RoformerPrecisionPolicy::MetalAutocast && has_prefix(name, "mask_")) {
+            return MNNPrecision::High;
+        }
+        return MNNPrecision::Normal;
+    }
+
+    int segment_attention_option(const std::string& name) const {
+        if (manifest_.attention_op != "mnn" || !has_prefix(name, "layer_")) {
+            return 0;
+        }
+        return 8;
+    }
+
     std::string segment_dir_;
     RoformerSegmentManifest manifest_;
     int stems_;
     std::string mask_mode_;
     MNNBackend backend_;
+    MNNPrecision precision_;
+    RoformerPrecisionPolicy precision_policy_;
+    RoformerSegmentCachePolicy segment_cache_policy_;
     int threads_;
     std::unordered_map<std::string, mss_mnn::MNNMaskCore> runners_;
 };
@@ -622,7 +752,15 @@ struct RoformerSeparator::Impl {
         : options(std::move(opts)),
           metadata(load_roformer_metadata(options.metadata_path)),
           manifest(load_roformer_manifest(options.segment_dir)),
-          runtime(options.segment_dir, manifest, metadata.stems, metadata.mask_mode, options.backend, options.threads) {}
+          runtime(options.segment_dir,
+                  manifest,
+                  metadata.stems,
+                  metadata.mask_mode,
+                  options.backend,
+                  options.precision,
+                  options.precision_policy,
+                  options.segment_cache_policy,
+                  options.threads) {}
 };
 
 RoformerSeparator::RoformerSeparator(RoformerSeparatorOptions options)

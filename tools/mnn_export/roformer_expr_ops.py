@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import torch
 
@@ -40,7 +42,19 @@ def rotary_cos_sin(rotary_embed, seq_len: int):
     return F.const(cos, list(cos.shape), F.NCHW, F.float), F.const(sin, list(sin.shape), F.NCHW, F.float)
 
 
-def attention(attn, x):
+def mnn_attention(q, k, v, tokens: int):
+    mask = F.const(np.zeros((tokens, tokens), dtype=np.float32), [tokens, tokens], F.NCHW, F.float)
+    describe = json.dumps(
+        {
+            "type": "Attention",
+            "main_type": "AttentionParam",
+            "main": {"kv_cache": False},
+        }
+    )
+    return F.jsonop([q, k, v, mask], describe, 1)[0]
+
+
+def attention(attn, x, *, attention_op: str = "manual"):
     x_norm = rms_norm(x, attn.norm.gamma)
     qkv = linear(x_norm, attn.to_qkv)
     batch, tokens, _ = qkv.shape
@@ -55,12 +69,17 @@ def attention(attn, x):
         q = rotate_half(q, cos, sin)
         k = rotate_half(k, cos, sin)
 
-    q = F.transpose(q, [0, 2, 1, 3])
-    k = F.transpose(k, [0, 2, 1, 3])
-    v = F.transpose(v, [0, 2, 1, 3])
-    sim = F.matmul(q, k, False, True) * float(head_dim ** -0.5)
-    out = F.matmul(F.softmax(sim, -1), v)
-    out = F.transpose(out, [0, 2, 1, 3])
+    if attention_op == "mnn":
+        out = F.reshape(mnn_attention(q, k, v, tokens), [batch, tokens, heads, head_dim])
+    elif attention_op == "manual":
+        q = F.transpose(q, [0, 2, 1, 3])
+        k = F.transpose(k, [0, 2, 1, 3])
+        v = F.transpose(v, [0, 2, 1, 3])
+        sim = F.matmul(q, k, False, True) * float(head_dim ** -0.5)
+        out = F.matmul(F.softmax(sim, -1), v)
+        out = F.transpose(out, [0, 2, 1, 3])
+    else:
+        raise ValueError(f"unsupported attention_op: {attention_op}")
     gates = F.sigmoid(linear(x_norm, attn.to_gates))
     out = out * F.unsqueeze(gates, -1)
     out = F.reshape(out, [batch, tokens, heads * head_dim])
@@ -75,9 +94,9 @@ def feed_forward(ff, x):
     return linear(x, net[4])
 
 
-def transformer(module, x):
+def transformer(module, x, *, attention_op: str = "manual"):
     for attn, ff in module.layers:
-        x = attention(attn, x) + x
+        x = attention(attn, x, attention_op=attention_op) + x
         x = feed_forward(ff, x) + x
     if hasattr(module.norm, "gamma"):
         x = rms_norm(x, module.norm.gamma)

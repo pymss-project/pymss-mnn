@@ -48,6 +48,41 @@ python tools/mnn_export/export_expr_micro_segments.py --preset bsr_hyperace_voc 
 python tools/mnn_export/export_expr_micro_segments.py --preset mbr_deux --out-dir benchmark_results/mnn_work --only manifest --time-batch 1 --freq-batch 16
 ```
 
+Export native MNN `Attention` transformer segments for flash attention:
+
+```sh
+python tools/mnn_export/export_expr_micro_segments.py \
+  --preset bsr_hyperace_voc \
+  --out-dir benchmark_results/mnn_flash_attention \
+  --time-batch 1 \
+  --freq-batch 1 \
+  --attention-op mnn
+
+python tools/mnn_export/export_expr_micro_segments.py \
+  --preset mbr_deux \
+  --out-dir benchmark_results/mnn_flash_attention \
+  --time-batch 1 \
+  --freq-batch 1 \
+  --attention-op mnn
+```
+
+`--attention-op mnn` replaces each transformer segment's
+`MatMul -> Softmax -> MatMul` attention with one MNN `Attention` op and records
+`"attention_op": "mnn"` in `manifest.json`. Keep `time_batch=1` and
+`freq_batch=1`: current MNN `Attention` gives incorrect results for the
+RoFormer frequency segments when this export batches multiple independent
+sequences. The C++ runtime reads the manifest and sets
+`Interpreter::ATTENTION_OPTION=8` for `layer_*` sessions. The linked MNN SDK must
+be built with `-DMNN_SUPPORT_TRANSFORMER_FUSE=ON`; otherwise C++ execution fails
+with unsupported `Attention`.
+
+On Metal/Auto, native MNN `Attention` transformer sessions are forced to
+`High` precision even if the CLI asks for `normal`. The FP16 Metal `Attention`
+path is currently not numerically safe for RoFormer's explicit all-zero add mask;
+`High` keeps CPU/Metal output aligned while still using the native `Attention`
+op. Do not use MNN's `attention_option=16` fused Metal variant for these
+segments until it has separate quality validation.
+
 Validate one mask-core chunk:
 
 ```sh
@@ -125,4 +160,42 @@ runtime/mnn/build/mss_mnn_roformer_separate \
   --output-dir benchmark_results/mnn_work/cpp_e2e/bsr_short \
   --backend cpu \
   --threads 1
+```
+
+For mobile-first Metal validation, keep the default `metal-fast` policy. MNN's
+public C++ runtime sets precision per session, so the micro-segment runtime
+applies the policy at segment/op-group level. For manual attention exports, only
+`band_split` runs in high precision while transformer `layer_*` and `mask_*`
+segments stay normal precision to favor FP16 throughput and lower memory. For
+native MNN `Attention` exports, transformer `layer_*` sessions are forced to
+high precision for correctness on Metal. Use `--precision normal
+--precision-policy uniform` for the absolute lowest-memory manual-attention run,
+`--precision-policy metal-autocast` for tighter CPU/Metal parity, and
+`--precision high --precision-policy uniform` for a full high-precision
+reference run. Use `--segment-cache transformers` to avoid keeping mask/segm
+sessions resident, `--segment-cache all` for maximum throughput, or
+`--segment-cache none` only when profiling backend allocation behavior.
+
+```sh
+runtime/mnn/build/mss_mnn_roformer_separate \
+  --preset bsr_hyperace_voc \
+  --segments benchmark_results/mnn_work/bsr_hyperace_voc/expr_micro_segments \
+  --metadata benchmark_results/mnn_work/bsr_hyperace_voc/bsr_hyperace_voc_metadata.json \
+  --input benchmark_results/mnn_work/cpp_e2e/input/test_3s.wav \
+  --output-dir benchmark_results/mnn_work/cpp_e2e/bsr_short_metal \
+  --backend metal \
+  --precision auto \
+  --precision-policy metal-fast \
+  --segment-cache transformers \
+  --threads 1
+```
+
+On the local M4 MacBook Air with the GPU-enabled transformer-fuse MNN SDK,
+native MNN `Attention` exports, and `test_3s.wav`, CPU vs Metal produced:
+
+```text
+metal-fast:
+  bsr_hyperace_voc vocals: max_abs=1.38e-06, mean_abs=1.22e-07, rms=1.70e-07
+  mbr_deux Vocals:        max_abs=1.39e-06, mean_abs=9.69e-08, rms=1.35e-07
+  mbr_deux Instrumental:  max_abs=1.85e-03, mean_abs=1.81e-04, rms=2.47e-04
 ```

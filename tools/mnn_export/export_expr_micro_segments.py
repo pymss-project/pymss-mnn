@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -50,6 +51,7 @@ def build_manifest(
     freq_batch,
     segm_shape,
     segm_output_shape,
+    attention_op,
 ):
     mask_mode = str(getattr(model, "mask_mode", preset.mask_mode))
     return {
@@ -71,6 +73,7 @@ def build_manifest(
         "dim_inputs": list(model.band_split.dim_inputs),
         "time_batch": time_batch,
         "freq_batch": freq_batch,
+        "attention_op": attention_op,
     }
 
 
@@ -85,21 +88,50 @@ def parse_args():
     parser.add_argument("--time-batch", type=int, default=1)
     parser.add_argument("--freq-batch", type=int, default=16)
     parser.add_argument("--only", choices=("all", "transformers", "mask_bands", "segm", "manifest"), default="all")
+    parser.add_argument(
+        "--attention-op",
+        choices=("manual", "mnn"),
+        default="manual",
+        help="Use legacy MatMul/Softmax attention or native MNN Attention in transformer segments. MNN Attention requires time/freq batch 1.",
+    )
     return parser.parse_args()
 
 
-def save_var(var, path: Path) -> None:
+def translate_json_ops(path: Path) -> None:
+    raw_path = path.with_suffix(".jsonop.mnn")
+    path.replace(raw_path)
+    cmd = [
+        "MNNConvert",
+        "-f",
+        "MNN",
+        "--modelFile",
+        str(raw_path),
+        "--MNNModel",
+        str(path),
+        "--bizCode",
+        "pymss",
+    ]
+    proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=1800)
+    path.with_suffix(".mnn.log").write_text(proc.stdout, encoding="utf-8")
+    if proc.returncode != 0:
+        raise RuntimeError(f"MNNConvert JSON op translation failed with code {proc.returncode}\n{proc.stdout}")
+    raw_path.unlink(missing_ok=True)
+
+
+def save_var(var, path: Path, *, translate_json: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     var.name = "output"
     F.save([var], str(path))
+    if translate_json:
+        translate_json_ops(path)
 
 
-def export_transformer(module, shape, path: Path):
+def export_transformer(module, shape, path: Path, *, attention_op: str):
     x = F.placeholder(list(shape), F.NCHW, F.float)
     x.name = "input"
-    y = transformer(module, x)
-    save_var(y, path)
-    return list(y.shape)
+    y = transformer(module, x, attention_op=attention_op)
+    save_var(y, path, translate_json=attention_op == "mnn")
+    return list(shape)
 
 
 def export_mask_band(model, band_index: int, shape, path: Path):
@@ -140,6 +172,8 @@ def main() -> None:
     mask_mode = str(getattr(model, "mask_mode", preset.mask_mode))
     if preset.input_shape[0] != 1:
         raise ValueError("HyperACE segm MNN export is validated with batch_size=1 only")
+    if args.attention_op == "mnn" and (args.time_batch != 1 or args.freq_batch != 1):
+        raise ValueError("MNN Attention export currently requires --time-batch 1 --freq-batch 1")
 
     batch, freq_channels, frames, complex_dim = preset.input_shape
     bands = len(model.band_split.dim_inputs)
@@ -169,6 +203,7 @@ def main() -> None:
             freq_batch=args.freq_batch,
             segm_shape=segm_shape,
             segm_output_shape=segm_output_shape,
+            attention_op=args.attention_op,
         )
         write_metadata(out_dir.parent / f"{preset.name}_metadata.json", preset, separator, tuple(mask_shape), compact=False)
         (out_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -194,7 +229,12 @@ def main() -> None:
                     "name": name,
                     "path": str(out_dir / f"{name}.mnn"),
                     "input_shape": time_shape,
-                    "output_shape": export_transformer(time_transformer, time_shape, out_dir / f"{name}.mnn"),
+                    "output_shape": export_transformer(
+                        time_transformer,
+                        time_shape,
+                        out_dir / f"{name}.mnn",
+                        attention_op=args.attention_op,
+                    ),
                 }
             )
             name = f"layer_{layer_index:02d}_freq"
@@ -203,7 +243,12 @@ def main() -> None:
                     "name": name,
                     "path": str(out_dir / f"{name}.mnn"),
                     "input_shape": freq_shape,
-                    "output_shape": export_transformer(freq_transformer, freq_shape, out_dir / f"{name}.mnn"),
+                    "output_shape": export_transformer(
+                        freq_transformer,
+                        freq_shape,
+                        out_dir / f"{name}.mnn",
+                        attention_op=args.attention_op,
+                    ),
                 }
             )
 
@@ -249,6 +294,7 @@ def main() -> None:
         freq_batch=args.freq_batch,
         segm_shape=segm_shape,
         segm_output_shape=segm_output_shape,
+        attention_op=args.attention_op,
     )
     (out_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(manifest, ensure_ascii=False, indent=2))

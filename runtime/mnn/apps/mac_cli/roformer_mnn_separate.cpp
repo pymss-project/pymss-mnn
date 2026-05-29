@@ -15,13 +15,19 @@ struct Args {
     std::string input_wav;
     std::string output_dir;
     mss_mnn::MNNBackend backend = mss_mnn::MNNBackend::CPU;
+    mss_mnn::MNNPrecision precision = mss_mnn::MNNPrecision::Auto;
+    mss_mnn::RoformerPrecisionPolicy precision_policy = mss_mnn::RoformerPrecisionPolicy::MetalFast;
+    mss_mnn::RoformerSegmentCachePolicy segment_cache_policy = mss_mnn::RoformerSegmentCachePolicy::TransformersOnly;
     int threads = 1;
 };
 
 void usage(const char* argv0) {
     std::cerr
         << "Usage: " << argv0 << " --preset bsr_hyperace_voc --segments dir --metadata file.json "
-        << "--input input.wav --output-dir out [--backend cpu|auto|metal|opencl|vulkan] [--threads 1]\n";
+        << "--input input.wav --output-dir out [--backend cpu|auto|metal|opencl|vulkan] "
+        << "[--precision auto|normal|high|low|low-bf16] "
+        << "[--precision-policy uniform|metal-fast|metal-autocast] "
+        << "[--segment-cache all|transformers|none] [--threads 1]\n";
 }
 
 Args parse_args(int argc, char** argv) {
@@ -46,6 +52,12 @@ Args parse_args(int argc, char** argv) {
             args.output_dir = require_value(key);
         } else if (key == "--backend") {
             args.backend = mss_mnn::mnn_backend_from_name(require_value(key));
+        } else if (key == "--precision") {
+            args.precision = mss_mnn::mnn_precision_from_name(require_value(key));
+        } else if (key == "--precision-policy") {
+            args.precision_policy = mss_mnn::roformer_precision_policy_from_name(require_value(key));
+        } else if (key == "--segment-cache") {
+            args.segment_cache_policy = mss_mnn::roformer_segment_cache_policy_from_name(require_value(key));
         } else if (key == "--threads") {
             args.threads = std::stoi(require_value(key));
         } else if (key == "--help" || key == "-h") {
@@ -75,6 +87,9 @@ int main(int argc, char** argv) {
         options.segment_dir = args.segment_dir;
         options.metadata_path = args.metadata;
         options.backend = args.backend;
+        options.precision = args.precision;
+        options.precision_policy = args.precision_policy;
+        options.segment_cache_policy = args.segment_cache_policy;
         options.threads = args.threads;
 
         mss_mnn::RoformerSeparator separator(options);

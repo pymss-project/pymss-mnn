@@ -29,6 +29,32 @@ MNNForwardType backend_type(MNNBackend backend) {
     return MNN_FORWARD_CPU;
 }
 
+MNN::BackendConfig::PrecisionMode precision_type(MNNBackend backend, MNNPrecision precision) {
+    if (precision == MNNPrecision::Auto) {
+        const bool metal_capable_backend = backend == MNNBackend::Metal || backend == MNNBackend::Auto;
+        precision = metal_capable_backend ? MNNPrecision::High : MNNPrecision::Normal;
+    }
+    switch (precision) {
+        case MNNPrecision::Auto:
+            return MNN::BackendConfig::Precision_Normal;
+        case MNNPrecision::Normal:
+            return MNN::BackendConfig::Precision_Normal;
+        case MNNPrecision::High:
+            return MNN::BackendConfig::Precision_High;
+        case MNNPrecision::Low:
+            return MNN::BackendConfig::Precision_Low;
+        case MNNPrecision::LowBF16:
+            return MNN::BackendConfig::Precision_Low_BF16;
+    }
+    return MNN::BackendConfig::Precision_Normal;
+}
+
+void apply_session_hints(MNN::Interpreter& interpreter, int attention_option) {
+    if (attention_option > 0) {
+        interpreter.setSessionHint(MNN::Interpreter::ATTENTION_OPTION, attention_option);
+    }
+}
+
 }  // namespace
 
 struct MNNMaskCore::Impl {
@@ -83,6 +109,45 @@ std::string mnn_backend_name(MNNBackend backend) {
     return "cpu";
 }
 
+MNNPrecision mnn_precision_from_name(const std::string& name) {
+    std::string value = name;
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (value == "normal") {
+        return MNNPrecision::Normal;
+    }
+    if (value == "auto") {
+        return MNNPrecision::Auto;
+    }
+    if (value == "high") {
+        return MNNPrecision::High;
+    }
+    if (value == "low") {
+        return MNNPrecision::Low;
+    }
+    if (value == "low-bf16" || value == "low_bf16" || value == "bf16") {
+        return MNNPrecision::LowBF16;
+    }
+    throw std::runtime_error("unknown MNN precision: " + name);
+}
+
+std::string mnn_precision_name(MNNPrecision precision) {
+    switch (precision) {
+        case MNNPrecision::Auto:
+            return "auto";
+        case MNNPrecision::Normal:
+            return "normal";
+        case MNNPrecision::High:
+            return "high";
+        case MNNPrecision::Low:
+            return "low";
+        case MNNPrecision::LowBF16:
+            return "low-bf16";
+    }
+    return "normal";
+}
+
 MNNModel::MNNModel(const std::string& model_path, MNNModelOptions options)
     : impl_(std::make_unique<Impl>()) {
     impl_->options = std::move(options);
@@ -90,10 +155,14 @@ MNNModel::MNNModel(const std::string& model_path, MNNModelOptions options)
     if (!impl_->interpreter) {
         throw std::runtime_error("failed to create MNN interpreter for " + model_path);
     }
+    apply_session_hints(*impl_->interpreter, impl_->options.attention_option);
 
     MNN::ScheduleConfig config;
+    MNN::BackendConfig backend_config;
+    backend_config.precision = precision_type(impl_->options.backend, impl_->options.precision);
     config.type = backend_type(impl_->options.backend);
     config.numThread = impl_->options.threads;
+    config.backendConfig = &backend_config;
     impl_->session = impl_->interpreter->createSession(config);
     if (!impl_->session) {
         throw std::runtime_error("failed to create MNN session");
@@ -163,10 +232,14 @@ MNNMaskCore::MNNMaskCore(const std::string& model_path, MaskCoreOptions options)
     if (!impl_->interpreter) {
         throw std::runtime_error("failed to create MNN interpreter for " + model_path);
     }
+    apply_session_hints(*impl_->interpreter, impl_->options.attention_option);
 
     MNN::ScheduleConfig config;
+    MNN::BackendConfig backend_config;
+    backend_config.precision = precision_type(impl_->options.backend, impl_->options.precision);
     config.type = backend_type(impl_->options.backend);
     config.numThread = impl_->options.threads;
+    config.backendConfig = &backend_config;
     impl_->session = impl_->interpreter->createSession(config);
     if (!impl_->session) {
         throw std::runtime_error("failed to create MNN session");

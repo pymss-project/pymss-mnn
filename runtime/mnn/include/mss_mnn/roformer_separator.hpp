@@ -35,13 +35,34 @@ struct RoformerSegmentManifest {
     int dim = 256;
     int time_batch = 1;
     int freq_batch = 16;
+    std::string attention_op = "manual";
     std::vector<int> dim_inputs;
 };
+
+enum class RoformerPrecisionPolicy {
+    Uniform,
+    MetalFast,
+    MetalAutocast,
+};
+
+enum class RoformerSegmentCachePolicy {
+    All,
+    TransformersOnly,
+    None,
+};
+
+RoformerPrecisionPolicy roformer_precision_policy_from_name(const std::string& name);
+std::string roformer_precision_policy_name(RoformerPrecisionPolicy policy);
+RoformerSegmentCachePolicy roformer_segment_cache_policy_from_name(const std::string& name);
+std::string roformer_segment_cache_policy_name(RoformerSegmentCachePolicy policy);
 
 struct RoformerSeparatorOptions {
     std::string segment_dir;
     std::string metadata_path;
     MNNBackend backend = MNNBackend::CPU;
+    MNNPrecision precision = MNNPrecision::Auto;
+    RoformerPrecisionPolicy precision_policy = RoformerPrecisionPolicy::MetalFast;
+    RoformerSegmentCachePolicy segment_cache_policy = RoformerSegmentCachePolicy::TransformersOnly;
     int threads = 1;
 };
 

@@ -16,6 +16,10 @@ find_library(MNN_LIBRARY
     NAMES MNN libMNN
     HINTS ${MNN_ROOT}/lib $ENV{MNN_ROOT}/lib
 )
+find_library(MNN_CL_LIBRARY
+    NAMES MNN_CL libMNN_CL
+    HINTS ${MNN_ROOT}/lib $ENV{MNN_ROOT}/lib
+)
 
 if(NOT MNN_INCLUDE_DIR OR NOT MNN_LIBRARY)
     message(FATAL_ERROR "MNN headers/library not found. Set -DMNN_ROOT=/path/to/MNN install.")
@@ -33,6 +37,9 @@ target_include_directories(mss_mnn_core
         ${MNN_INCLUDE_DIR}
 )
 target_link_libraries(mss_mnn_core PUBLIC ${MNN_LIBRARY})
+if(MNN_CL_LIBRARY)
+    target_link_libraries(mss_mnn_core PUBLIC ${MNN_CL_LIBRARY})
+endif()
 
 if(MSS_MNN_BUILD_APPS)
     add_executable(mss_mnn_mask_core apps/mac_cli/mnn_mask_core_cli.cpp)

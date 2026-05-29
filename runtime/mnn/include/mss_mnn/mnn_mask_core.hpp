@@ -16,14 +16,26 @@ enum class MNNBackend {
     Vulkan,
 };
 
+enum class MNNPrecision {
+    Auto,
+    Normal,
+    High,
+    Low,
+    LowBF16,
+};
+
 MNNBackend mnn_backend_from_name(const std::string& name);
 std::string mnn_backend_name(MNNBackend backend);
+MNNPrecision mnn_precision_from_name(const std::string& name);
+std::string mnn_precision_name(MNNPrecision precision);
 
 struct MaskCoreOptions {
     std::string input_name = "stft_repr";
     std::string output_name = "mask";
     MNNBackend backend = MNNBackend::CPU;
+    MNNPrecision precision = MNNPrecision::Auto;
     int threads = 1;
+    int attention_option = 0;
 };
 
 struct MNNTensor {
@@ -34,7 +46,9 @@ struct MNNTensor {
 
 struct MNNModelOptions {
     MNNBackend backend = MNNBackend::CPU;
+    MNNPrecision precision = MNNPrecision::Auto;
     int threads = 1;
+    int attention_option = 0;
 };
 
 class MNNModel {
