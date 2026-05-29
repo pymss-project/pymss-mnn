@@ -33,6 +33,7 @@ class ExprMicroRuntime:
         self.manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
         self.dim_inputs = tuple(int(value) for value in self.manifest.get("dim_inputs", ()))
         self.mask_mode = str(self.manifest.get("mask_mode", "no_segm"))
+        self.transformer_split = str(self.manifest.get("transformer_split", "fused"))
         manifest_depth = self.manifest.get("depth")
         if manifest_depth is not None and int(manifest_depth) != depth:
             raise ValueError(f"manifest depth {manifest_depth} does not match runtime depth {depth}")
@@ -56,6 +57,11 @@ class ExprMicroRuntime:
             self._runners[name] = runner
         return runner(x)
 
+    def run_transformer(self, name: str, x: np.ndarray) -> np.ndarray:
+        if self.transformer_split == "attention_ffn":
+            return self.run(f"{name}_ffn", self.run(f"{name}_attn", x))
+        return self.run(name, x)
+
     def run_time(self, layer_index: int, x: np.ndarray) -> np.ndarray:
         out = np.empty_like(x)
         batch, frames, bands, dim = x.shape
@@ -67,9 +73,9 @@ class ExprMicroRuntime:
             if chunk.shape[0] != self.time_batch:
                 pad = np.zeros((self.time_batch - chunk.shape[0], frames, dim), dtype=np.float32)
                 chunk = np.concatenate([chunk, pad], axis=0)
-                flat_out[start:end] = self.run(f"layer_{layer_index:02d}_time", chunk)[: end - start]
+                flat_out[start:end] = self.run_transformer(f"layer_{layer_index:02d}_time", chunk)[: end - start]
             else:
-                flat_out[start:end] = self.run(f"layer_{layer_index:02d}_time", chunk)
+                flat_out[start:end] = self.run_transformer(f"layer_{layer_index:02d}_time", chunk)
         out[...] = flat_out.reshape(batch, bands, frames, dim).transpose(0, 2, 1, 3)
         return out
 
@@ -84,9 +90,9 @@ class ExprMicroRuntime:
             if chunk.shape[0] != self.freq_batch:
                 pad = np.zeros((self.freq_batch - chunk.shape[0], bands, dim), dtype=np.float32)
                 chunk = np.concatenate([chunk, pad], axis=0)
-                flat_out[start:end] = self.run(f"layer_{layer_index:02d}_freq", chunk)[: end - start]
+                flat_out[start:end] = self.run_transformer(f"layer_{layer_index:02d}_freq", chunk)[: end - start]
             else:
-                flat_out[start:end] = self.run(f"layer_{layer_index:02d}_freq", chunk)
+                flat_out[start:end] = self.run_transformer(f"layer_{layer_index:02d}_freq", chunk)
         out[...] = flat_out.reshape(batch, frames, bands, dim)
         return out
 

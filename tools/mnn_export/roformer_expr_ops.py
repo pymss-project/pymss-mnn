@@ -103,6 +103,19 @@ def transformer(module, x, *, attention_op: str = "manual"):
     return x
 
 
+def transformer_attention_block(module, x, *, attention_op: str = "manual"):
+    attn, _ = module.layers[0]
+    return attention(attn, x, attention_op=attention_op) + x
+
+
+def transformer_ffn_block(module, x):
+    _, ff = module.layers[0]
+    x = feed_forward(ff, x) + x
+    if hasattr(module.norm, "gamma"):
+        x = rms_norm(x, module.norm.gamma)
+    return x
+
+
 def band_split(model, stft_repr):
     batch, freq_channels, frames, complex_dim = stft_repr.shape
     flat = F.reshape(F.transpose(stft_repr, [0, 2, 1, 3]), [batch, frames, freq_channels * complex_dim])

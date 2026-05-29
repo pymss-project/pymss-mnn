@@ -101,16 +101,18 @@ allocations.
   acceleration when the linked MNN SDK includes Metal. Generic `Auto` precision
   uses `High` precision for `Metal` and `Auto` backends because normal precision
   can introduce accumulated error on deep transformer models.
-- RoFormer `MetalFast` is the default when `precision=Auto`: only `band_split`
-  runs in `High`, while transformer `layer_*` and `mask_*` segments stay
-  `Normal` to minimize GPU memory and favor FP16 throughput on mobile. If the
-  segment manifest was exported with native MNN `Attention`, Metal/Auto
-  transformer `layer_*` sessions are forced to `High`; MNN's FP16 Metal
-  `Attention` path is not numerically safe for RoFormer explicit masks.
+- RoFormer `MetalFast` is the default when `precision=Auto`: it keeps the
+  smallest validated `High` set and leaves the rest in `Normal` to minimize GPU
+  memory and favor FP16 throughput on mobile. For native MNN `Attention`
+  manifests exported as split `attention_ffn` segments, BSR-family `_attn`
+  sessions run in `Normal` while `_ffn` stays `High`; MelBandRoFormer `_attn`
+  sessions are forced to `High` because FP16 attention accumulates too much
+  error end to end.
 - Native MNN `Attention` segments require an MNN SDK built with
   `-DMNN_SUPPORT_TRANSFORMER_FUSE=ON`. The runtime sets
-  `Interpreter::ATTENTION_OPTION=8` for RoFormer `layer_*` segments whose
-  manifest has `"attention_op": "mnn"`.
+  `Interpreter::ATTENTION_OPTION=8` for RoFormer `layer_*` attention segments
+  whose manifest has `"attention_op": "mnn"`. Unsplit native-attention
+  transformer segments still run in `High` on Metal/Auto.
 - Use `precision=Normal` with `precision_policy=Uniform` for the absolute
   lowest-memory run, `precision_policy=MetalAutocast` for a better quality/speed
   tradeoff, and `precision=High` for a full high-precision reference run.

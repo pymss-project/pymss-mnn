@@ -15,7 +15,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from tools.mnn_export.presets import default_out_dir, get_preset, preset_names  # noqa: E402
-from tools.mnn_export.roformer_expr_ops import band_split, mask_band, transformer  # noqa: E402
+from tools.mnn_export.roformer_expr_ops import band_split, mask_band, transformer, transformer_attention_block, transformer_ffn_block  # noqa: E402
 from tools.mnn_export.roformer_mnn import build_separator, prepare_model_for_export, run_mnnconvert, write_metadata  # noqa: E402
 
 
@@ -52,6 +52,7 @@ def build_manifest(
     segm_shape,
     segm_output_shape,
     attention_op,
+    transformer_split,
 ):
     mask_mode = str(getattr(model, "mask_mode", preset.mask_mode))
     return {
@@ -74,6 +75,7 @@ def build_manifest(
         "time_batch": time_batch,
         "freq_batch": freq_batch,
         "attention_op": attention_op,
+        "transformer_split": transformer_split,
     }
 
 
@@ -93,6 +95,12 @@ def parse_args():
         choices=("manual", "mnn"),
         default="manual",
         help="Use legacy MatMul/Softmax attention or native MNN Attention in transformer segments. MNN Attention requires time/freq batch 1.",
+    )
+    parser.add_argument(
+        "--transformer-split",
+        choices=("fused", "attention_ffn"),
+        default="fused",
+        help="Export each transformer as one segment or split it into attention and FFN segments for segment-level precision control.",
     )
     return parser.parse_args()
 
@@ -131,6 +139,19 @@ def export_transformer(module, shape, path: Path, *, attention_op: str):
     x.name = "input"
     y = transformer(module, x, attention_op=attention_op)
     save_var(y, path, translate_json=attention_op == "mnn")
+    return list(shape)
+
+
+def export_transformer_split(module, shape, path_prefix: Path, *, attention_op: str):
+    x = F.placeholder(list(shape), F.NCHW, F.float)
+    x.name = "input"
+    y = transformer_attention_block(module, x, attention_op=attention_op)
+    save_var(y, path_prefix.with_name(path_prefix.name + "_attn.mnn"), translate_json=attention_op == "mnn")
+
+    x = F.placeholder(list(shape), F.NCHW, F.float)
+    x.name = "input"
+    y = transformer_ffn_block(module, x)
+    save_var(y, path_prefix.with_name(path_prefix.name + "_ffn.mnn"))
     return list(shape)
 
 
@@ -174,6 +195,8 @@ def main() -> None:
         raise ValueError("HyperACE segm MNN export is validated with batch_size=1 only")
     if args.attention_op == "mnn" and (args.time_batch != 1 or args.freq_batch != 1):
         raise ValueError("MNN Attention export currently requires --time-batch 1 --freq-batch 1")
+    if args.transformer_split == "attention_ffn" and args.attention_op != "mnn":
+        raise ValueError("--transformer-split attention_ffn is intended for --attention-op mnn")
 
     batch, freq_channels, frames, complex_dim = preset.input_shape
     bands = len(model.band_split.dim_inputs)
@@ -204,6 +227,7 @@ def main() -> None:
             segm_shape=segm_shape,
             segm_output_shape=segm_output_shape,
             attention_op=args.attention_op,
+            transformer_split=args.transformer_split,
         )
         write_metadata(out_dir.parent / f"{preset.name}_metadata.json", preset, separator, tuple(mask_shape), compact=False)
         (out_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -224,33 +248,61 @@ def main() -> None:
     if args.only in ("all", "transformers"):
         for layer_index, (time_transformer, freq_transformer) in enumerate(model.layers):
             name = f"layer_{layer_index:02d}_time"
-            exported.append(
-                {
-                    "name": name,
-                    "path": str(out_dir / f"{name}.mnn"),
-                    "input_shape": time_shape,
-                    "output_shape": export_transformer(
-                        time_transformer,
-                        time_shape,
-                        out_dir / f"{name}.mnn",
-                        attention_op=args.attention_op,
-                    ),
-                }
-            )
+            if args.transformer_split == "attention_ffn":
+                output_shape = export_transformer_split(
+                    time_transformer,
+                    time_shape,
+                    out_dir / name,
+                    attention_op=args.attention_op,
+                )
+                exported.extend(
+                    [
+                        {"name": f"{name}_attn", "path": str(out_dir / f"{name}_attn.mnn"), "input_shape": time_shape, "output_shape": output_shape},
+                        {"name": f"{name}_ffn", "path": str(out_dir / f"{name}_ffn.mnn"), "input_shape": time_shape, "output_shape": output_shape},
+                    ]
+                )
+            else:
+                exported.append(
+                    {
+                        "name": name,
+                        "path": str(out_dir / f"{name}.mnn"),
+                        "input_shape": time_shape,
+                        "output_shape": export_transformer(
+                            time_transformer,
+                            time_shape,
+                            out_dir / f"{name}.mnn",
+                            attention_op=args.attention_op,
+                        ),
+                    }
+                )
             name = f"layer_{layer_index:02d}_freq"
-            exported.append(
-                {
-                    "name": name,
-                    "path": str(out_dir / f"{name}.mnn"),
-                    "input_shape": freq_shape,
-                    "output_shape": export_transformer(
-                        freq_transformer,
-                        freq_shape,
-                        out_dir / f"{name}.mnn",
-                        attention_op=args.attention_op,
-                    ),
-                }
-            )
+            if args.transformer_split == "attention_ffn":
+                output_shape = export_transformer_split(
+                    freq_transformer,
+                    freq_shape,
+                    out_dir / name,
+                    attention_op=args.attention_op,
+                )
+                exported.extend(
+                    [
+                        {"name": f"{name}_attn", "path": str(out_dir / f"{name}_attn.mnn"), "input_shape": freq_shape, "output_shape": output_shape},
+                        {"name": f"{name}_ffn", "path": str(out_dir / f"{name}_ffn.mnn"), "input_shape": freq_shape, "output_shape": output_shape},
+                    ]
+                )
+            else:
+                exported.append(
+                    {
+                        "name": name,
+                        "path": str(out_dir / f"{name}.mnn"),
+                        "input_shape": freq_shape,
+                        "output_shape": export_transformer(
+                            freq_transformer,
+                            freq_shape,
+                            out_dir / f"{name}.mnn",
+                            attention_op=args.attention_op,
+                        ),
+                    }
+                )
 
     if args.only in ("all", "mask_bands") and mask_mode != "segm_only":
         for band_index, dim_input in enumerate(model.band_split.dim_inputs):
@@ -295,6 +347,7 @@ def main() -> None:
         segm_shape=segm_shape,
         segm_output_shape=segm_output_shape,
         attention_op=args.attention_op,
+        transformer_split=args.transformer_split,
     )
     (out_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(manifest, ensure_ascii=False, indent=2))

@@ -30,12 +30,15 @@ struct RoformerMetadata {
 };
 
 struct RoformerSegmentManifest {
+    std::string preset;
+    std::string model_type;
     int depth = 12;
     int num_bands = 0;
     int dim = 256;
     int time_batch = 1;
     int freq_batch = 16;
     std::string attention_op = "manual";
+    std::string transformer_split = "fused";
     std::vector<int> dim_inputs;
 };
 

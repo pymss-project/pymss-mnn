@@ -196,11 +196,14 @@ RoformerMetadata load_roformer_metadata(const std::string& path) {
 RoformerSegmentManifest load_roformer_manifest(const std::string& segment_dir) {
     const std::string text = read_text(segment_dir + "/manifest.json");
     RoformerSegmentManifest manifest;
+    manifest.preset = json_string_or_default(text, "preset", "");
+    manifest.model_type = json_string_or_default(text, "model_type", "");
     manifest.depth = json_int(text, "depth");
     manifest.num_bands = json_int(text, "num_bands");
     manifest.time_batch = json_int(text, "time_batch");
     manifest.freq_batch = json_int(text, "freq_batch");
     manifest.attention_op = json_string_or_default(text, "attention_op", "manual");
+    manifest.transformer_split = json_string_or_default(text, "transformer_split", "fused");
     manifest.dim_inputs = json_int_array(text, "dim_inputs");
     const auto band_shape = json_int_array(text, "band_shape");
     if (band_shape.size() != 4) {
@@ -518,7 +521,7 @@ public:
                     const std::size_t src = ((static_cast<std::size_t>(t) * bands + band) * dim);
                     std::copy(x.begin() + static_cast<std::ptrdiff_t>(src), x.begin() + static_cast<std::ptrdiff_t>(src + dim), in.begin() + static_cast<std::ptrdiff_t>(t * dim));
                 }
-                auto out = run("layer_" + two(layer) + "_time", in, {1, frames, dim});
+                auto out = run_transformer("layer_" + two(layer) + "_time", in, {1, frames, dim});
                 for (int t = 0; t < frames; ++t) {
                     const std::size_t dst = ((static_cast<std::size_t>(t) * bands + band) * dim);
                     std::copy(out.begin() + static_cast<std::ptrdiff_t>(t * dim), out.begin() + static_cast<std::ptrdiff_t>((t + 1) * dim), next.begin() + static_cast<std::ptrdiff_t>(dst));
@@ -534,7 +537,7 @@ public:
                     const std::size_t dst = static_cast<std::size_t>(t) * bands * dim;
                     std::copy(x.begin() + static_cast<std::ptrdiff_t>(src), x.begin() + static_cast<std::ptrdiff_t>(src + bands * dim), in.begin() + static_cast<std::ptrdiff_t>(dst));
                 }
-                auto out = run("layer_" + two(layer) + "_freq", in, {manifest_.freq_batch, bands, dim});
+                auto out = run_transformer("layer_" + two(layer) + "_freq", in, {manifest_.freq_batch, bands, dim});
                 for (int t = 0; t < actual; ++t) {
                     const std::size_t src = static_cast<std::size_t>(t) * bands * dim;
                     const std::size_t dst = static_cast<std::size_t>(start + t) * bands * dim;
@@ -605,6 +608,14 @@ private:
         return value.rfind(prefix, 0) == 0;
     }
 
+    static bool has_suffix(const std::string& value, const std::string& suffix) {
+        return value.size() >= suffix.size() && value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+    }
+
+    bool supports_split_attention_fp16() const {
+        return manifest_.model_type.find("BSRoformer") != std::string::npos;
+    }
+
     mss_mnn::MNNMaskCore create_runner(const std::string& name) const {
         mss_mnn::MaskCoreOptions options;
         options.input_name = "input";
@@ -614,6 +625,13 @@ private:
         options.threads = threads_;
         options.attention_option = segment_attention_option(name);
         return mss_mnn::MNNMaskCore(segment_dir_ + "/" + name + ".mnn", options);
+    }
+
+    std::vector<float> run_transformer(const std::string& name, const std::vector<float>& input, const std::vector<int>& shape) {
+        if (manifest_.transformer_split == "attention_ffn") {
+            return run(name + "_ffn", run(name + "_attn", input, shape), shape);
+        }
+        return run(name, input, shape);
     }
 
     bool should_cache(const std::string& name) const {
@@ -630,8 +648,17 @@ private:
 
     MNNPrecision segment_precision(const std::string& name) const {
         const bool metal_capable_backend = backend_ == MNNBackend::Metal || backend_ == MNNBackend::Auto;
+        if (metal_capable_backend && manifest_.attention_op == "mnn" && manifest_.transformer_split == "attention_ffn") {
+            if (has_suffix(name, "_attn")) {
+                const bool force_high = precision_ == MNNPrecision::High || !supports_split_attention_fp16();
+                return force_high ? MNNPrecision::High : MNNPrecision::Normal;
+            }
+            if (has_suffix(name, "_ffn")) {
+                return MNNPrecision::High;
+            }
+        }
         if (metal_capable_backend && manifest_.attention_op == "mnn" && has_prefix(name, "layer_")) {
-            // Metal FP16 Attention is not reliable with RoFormer's explicit add mask.
+            // Unsplit transformer segments accumulate too much FP16 error on Metal.
             return MNNPrecision::High;
         }
         const bool uses_segment_autocast = precision_policy_ == RoformerPrecisionPolicy::MetalFast ||
@@ -649,7 +676,7 @@ private:
     }
 
     int segment_attention_option(const std::string& name) const {
-        if (manifest_.attention_op != "mnn" || !has_prefix(name, "layer_")) {
+        if (manifest_.attention_op != "mnn" || !has_prefix(name, "layer_") || has_suffix(name, "_ffn")) {
             return 0;
         }
         return 8;
