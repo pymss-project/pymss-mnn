@@ -105,10 +105,11 @@ precision set, and `MetalAutocast` raises additional mask segments for tighter
 CPU/Metal parity.
 `RoformerSegmentCachePolicy` controls how many micro-segment sessions stay
 resident: `All` is fastest, `BlocksOnly` caches `block_*.mnn` plus
-`band_split`, `TransformersOnly` avoids caching block/segm heads, and `None`
-disables the runtime cache for diagnostics. On Metal, `None` can be slower and
-may not lower peak footprint because the backend can retain internal
-allocations.
+`band_split`, `MaskHeadsOnly` caches `band_split` plus `mask_group_*`,
+`mask_band_*`, and `segm_*`, `TransformersOnly` caches legacy `layer_*`
+transformer segments plus grouped mask heads, and `None` disables the runtime
+cache for diagnostics. On Metal, `None` can be slower and may not lower peak
+footprint because the backend can retain internal allocations.
 On Apple platforms, the runtime wraps chunk and MNN segment execution in scoped
 Objective-C autorelease pools. This drains temporary Metal objects during long
 audio runs instead of letting them accumulate until process exit.
@@ -122,9 +123,9 @@ resident by `segment_cache_policy=BlocksOnly` or `All`; the default
 `TransformersOnly` still loads one block at a time because a full set of
 fixed-shape block sessions can exceed low-memory targets on larger frame
 exports.
-`TransformersOnly` also caches `mask_group_*.mnn` because reloading grouped mask
-models per chunk costs much more than keeping those few sessions resident; it
-still avoids caching legacy `mask_band_*.mnn` per-band heads.
+`MaskHeadsOnly` is the low-memory speed tradeoff for block exports: it avoids
+keeping large transformer blocks resident but reuses the smaller output-head
+sessions whose setup overhead is still visible on long audio.
 The runner also honors `"time_batch"`, but any export that batches transformer
 sequences must be quality-checked per model/backend before release.
 The macOS CLI accepts `--profile` to print per-stage timing, including
@@ -144,14 +145,19 @@ category.
   error end to end.
 - Native MNN `Attention` segments require an MNN SDK built with
   `-DMNN_SUPPORT_TRANSFORMER_FUSE=ON`. The runtime sets
-  `Interpreter::ATTENTION_OPTION=8` for RoFormer `layer_*` attention segments
-  whose manifest has `"attention_op": "mnn"`. Unsplit native-attention
-  transformer segments still run in `High` on Metal/Auto.
+  `Interpreter::ATTENTION_OPTION=8` for RoFormer `layer_*` and `block_*`
+  attention segments whose manifest has `"attention_op": "mnn"` by default. Use
+  `--attention-kernel simple|flash` in the macOS CLI to select
+  `ATTENTION_OPTION=0` or `8`. MNN's current Metal fused path is not exposed
+  because it needs SDK source changes for correct non-causal RoFormer attention.
+  Unsplit native-attention transformer segments still run in `High` on
+  Metal/Auto.
 - Use `precision=Normal` with `precision_policy=Uniform` for the absolute
   lowest-memory run, `precision_policy=MetalAutocast` for a better quality/speed
   tradeoff, and `precision=High` for a full high-precision reference run.
-- Use `segment_cache_policy=TransformersOnly` for mobile-first memory. Switch to
-  `All` for maximum throughput; use `None` only when profiling a target backend.
+- Use `segment_cache_policy=MaskHeadsOnly` for the mobile-first middle ground on
+  block exports. Switch to `All` for maximum throughput; use `None` only when
+  profiling a target backend.
 - Android: use `CPU` for fallback, `OpenCL`, `Vulkan`, or `Auto` when the SDK and
   device support those backends.
 

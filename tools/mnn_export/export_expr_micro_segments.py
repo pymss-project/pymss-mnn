@@ -126,7 +126,7 @@ def parse_args():
         "--attention-op",
         choices=("manual", "mnn"),
         default="manual",
-        help="Use legacy MatMul/Softmax attention or native MNN Attention in transformer segments. MNN Attention requires time/freq batch 1.",
+        help="Use legacy MatMul/Softmax attention or native MNN Attention in transformer segments.",
     )
     parser.add_argument(
         "--transformer-split",
@@ -234,7 +234,7 @@ def export_transformer(module, shape, path: Path, *, attention_op: str):
     x.name = "input"
     y = transformer(module, x, attention_op=attention_op)
     save_var(y, path, translate_json=attention_op == "mnn")
-    return list(shape)
+    return list(y.shape) if y.shape is not None else list(shape)
 
 
 def export_transformer_split(module, shape, path_prefix: Path, *, attention_op: str):
@@ -247,7 +247,7 @@ def export_transformer_split(module, shape, path_prefix: Path, *, attention_op: 
     x.name = "input"
     y = transformer_ffn_block(module, x)
     save_var(y, path_prefix.with_name(path_prefix.name + "_ffn.mnn"))
-    return list(shape)
+    return list(y.shape) if y.shape is not None else list(shape)
 
 
 def export_mask_band(model, band_index: int, shape, path: Path):
@@ -290,7 +290,7 @@ def export_transformer_block(
         else:
             raise ValueError(f"unsupported transformer block mode: {mode}")
     save_var(y, path, translate_json=attention_op == "mnn")
-    return list(y.shape)
+    return list(y.shape) if y.shape is not None else list(shape)
 
 
 def export_segm(model, stem_index: int, shape, out_dir: Path):
@@ -323,8 +323,6 @@ def main() -> None:
     mask_mode = str(getattr(model, "mask_mode", preset.mask_mode))
     if preset.input_shape[0] != 1:
         raise ValueError("HyperACE segm MNN export is validated with batch_size=1 only")
-    if args.attention_op == "mnn" and not args.transformer_block_size and (args.time_batch != 1 or args.freq_batch != 1):
-        raise ValueError("MNN Attention export currently requires --time-batch 1 --freq-batch 1")
     if args.transformer_split == "attention_ffn" and args.attention_op != "mnn":
         raise ValueError("--transformer-split attention_ffn is intended for --attention-op mnn")
     if args.transformer_block_size < 0:

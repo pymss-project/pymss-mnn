@@ -344,6 +344,9 @@ RoformerSegmentCachePolicy roformer_segment_cache_policy_from_name(const std::st
     if (value == "blocks" || value == "block") {
         return RoformerSegmentCachePolicy::BlocksOnly;
     }
+    if (value == "heads" || value == "head" || value == "mask" || value == "masks" || value == "mask-heads") {
+        return RoformerSegmentCachePolicy::MaskHeadsOnly;
+    }
     if (value == "none" || value == "off" || value == "no-cache") {
         return RoformerSegmentCachePolicy::None;
     }
@@ -358,10 +361,36 @@ std::string roformer_segment_cache_policy_name(RoformerSegmentCachePolicy policy
             return "transformers";
         case RoformerSegmentCachePolicy::BlocksOnly:
             return "blocks";
+        case RoformerSegmentCachePolicy::MaskHeadsOnly:
+            return "mask-heads";
         case RoformerSegmentCachePolicy::None:
             return "none";
     }
     return "all";
+}
+
+RoformerAttentionKernel roformer_attention_kernel_from_name(const std::string& name) {
+    std::string value = name;
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (value == "simple" || value == "off" || value == "none") {
+        return RoformerAttentionKernel::Simple;
+    }
+    if (value == "flash") {
+        return RoformerAttentionKernel::Flash;
+    }
+    throw std::runtime_error("unknown RoFormer attention kernel: " + name);
+}
+
+std::string roformer_attention_kernel_name(RoformerAttentionKernel kernel) {
+    switch (kernel) {
+        case RoformerAttentionKernel::Simple:
+            return "simple";
+        case RoformerAttentionKernel::Flash:
+            return "flash";
+    }
+    return "flash";
 }
 
 std::vector<float> hann_window(int size) {
@@ -580,6 +609,7 @@ public:
                    MNNPrecision precision,
                    RoformerPrecisionPolicy precision_policy,
                    RoformerSegmentCachePolicy segment_cache_policy,
+                   RoformerAttentionKernel attention_kernel,
                    int threads,
                    ProfileRecorder* profile)
         : segment_dir_(std::move(segment_dir)),
@@ -590,6 +620,7 @@ public:
           precision_(precision),
           precision_policy_(precision_policy),
           segment_cache_policy_(segment_cache_policy),
+          attention_kernel_(attention_kernel),
           threads_(threads),
           profile_(profile) {}
 
@@ -843,6 +874,9 @@ private:
                 return name == "band_split" || has_prefix(name, "layer_") || has_prefix(name, "mask_group_");
             case RoformerSegmentCachePolicy::BlocksOnly:
                 return name == "band_split" || has_prefix(name, "block_");
+            case RoformerSegmentCachePolicy::MaskHeadsOnly:
+                return name == "band_split" || has_prefix(name, "mask_group_") ||
+                       has_prefix(name, "mask_band_") || has_prefix(name, "segm_");
             case RoformerSegmentCachePolicy::None:
                 return false;
         }
@@ -882,8 +916,16 @@ private:
     }
 
     int segment_attention_option(const std::string& name) const {
-        if (manifest_.attention_op != "mnn" || !has_prefix(name, "layer_") || has_suffix(name, "_ffn")) {
+        const bool native_attention_segment = has_prefix(name, "block_") ||
+                                              (has_prefix(name, "layer_") && !has_suffix(name, "_ffn"));
+        if (manifest_.attention_op != "mnn" || !native_attention_segment) {
             return 0;
+        }
+        switch (attention_kernel_) {
+            case RoformerAttentionKernel::Simple:
+                return 0;
+            case RoformerAttentionKernel::Flash:
+                return 8;
         }
         return 8;
     }
@@ -896,6 +938,7 @@ private:
     MNNPrecision precision_;
     RoformerPrecisionPolicy precision_policy_;
     RoformerSegmentCachePolicy segment_cache_policy_;
+    RoformerAttentionKernel attention_kernel_;
     int threads_;
     ProfileRecorder* profile_ = nullptr;
     std::unordered_map<std::string, mss_mnn::MNNMaskCore> runners_;
@@ -1047,6 +1090,7 @@ struct RoformerSeparator::Impl {
                                                        options.precision,
                                                        options.precision_policy,
                                                        options.segment_cache_policy,
+                                                       options.attention_kernel,
                                                        options.threads,
                                                        &profile);
         }

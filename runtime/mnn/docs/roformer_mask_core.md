@@ -105,23 +105,34 @@ python tools/mnn_export/export_expr_micro_segments.py \
 
 `--attention-op mnn` replaces each transformer segment's
 `MatMul -> Softmax -> MatMul` attention with one MNN `Attention` op and records
-`"attention_op": "mnn"` in `manifest.json`. `--transformer-split
+`"attention_op": "mnn"` in `manifest.json`. When the transformer input batch is
+larger than one, the exporter emits one batch=1 MNN `Attention` op per
+independent sequence and concatenates the results, because MNN's native
+`Attention` batch dimension is not numerically reliable for RoFormer. Linear,
+gate, FFN, and residual work remains batched. `--transformer-split
 attention_ffn` exports each transformer as `*_attn.mnn` and `*_ffn.mnn`, letting
-the C++ runtime choose precision per op group. Keep `time_batch=1` and
-`freq_batch=1`: current MNN `Attention` gives incorrect results for the
-RoFormer frequency segments when this export batches multiple independent
-sequences. The C++ runtime reads the manifest and sets
-`Interpreter::ATTENTION_OPTION=8` for `layer_*_attn` sessions. The linked MNN SDK
-must be built with `-DMNN_SUPPORT_TRANSFORMER_FUSE=ON`; otherwise C++ execution
-fails with unsupported `Attention`.
+the C++ runtime choose precision per op group. The C++ runtime reads the
+manifest and sets
+`Interpreter::ATTENTION_OPTION=8` for `layer_*_attn` sessions by default. Pass
+`--attention-kernel simple|flash` to the C++ separator to choose
+`ATTENTION_OPTION=0` or `8` for native-attention segments. The linked MNN SDK
+must be built with `-DMNN_SUPPORT_TRANSFORMER_FUSE=ON`; otherwise C++
+execution fails with unsupported `Attention`.
 
 On Metal/Auto, split native-attention exports use the validated per-family
 policy. BSR-family `*_attn` sessions can run in `Normal`/FP16 while `*_ffn`
 stays `High`; MelBandRoFormer `*_attn` and `*_ffn` stay `High` because FP16
 attention accumulates too much end-to-end error. Unsplit native-attention
-transformer sessions are also forced to `High`. Do not use MNN's
-`attention_option=16` fused Metal variant for these segments until it has
-separate quality validation.
+transformer sessions are also forced to `High`. MNN's current Metal fused path
+is not exposed here because it needs SDK source changes for correct non-causal
+RoFormer attention; this repository keeps the open-source runtime on unmodified
+MNN SDKs.
+
+The batch-unrolled native-attention exporter also works inside block graphs. A
+BSR `frames=180` `block_00` probe with shape `[1, 180, 62, 256]` matched the
+PyTorch block at high precision with `rmse=1.83e-4` (`ref_rms=0.731`, including
+the known GELU approximation difference). The same block graph runs with
+unmodified MNN Metal flash attention.
 
 Validate one mask-core chunk:
 
@@ -213,7 +224,8 @@ precision while `*_ffn` stays high precision; MelBandRoFormer `*_attn` and
 for the absolute lowest-memory manual-attention run, `--precision-policy
 metal-autocast` for tighter CPU/Metal parity, and `--precision high
 --precision-policy uniform` for a full high-precision reference run. Use
-`--segment-cache transformers` to avoid keeping mask/segm sessions resident,
+`--segment-cache mask-heads` on block exports to reuse the smaller
+band/mask/segm sessions without keeping large transformer blocks resident,
 `--segment-cache all` for maximum throughput, or `--segment-cache none` only
 when profiling backend allocation behavior.
 

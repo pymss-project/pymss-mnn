@@ -48,12 +48,13 @@ def rms_norm(x, gamma, eps=1e-12):
     return x * F.rsqrt(mean_sq + eps) * const_tensor(gamma)
 
 
-def rotate_half(q, cos, sin):
+def rotate_half(q, cos, sin, shape=None):
+    shape = q.shape if shape is None else shape
     even = F.strided_slice(q, [0, 0, 0, 0], [0, 0, 0, 0], [1, 1, 1, 2], 7, 15)
     odd = F.strided_slice(q, [0, 0, 0, 1], [0, 0, 0, 0], [1, 1, 1, 2], 7, 15)
     rotated_even = even * cos - odd * sin
     rotated_odd = odd * cos + even * sin
-    return F.reshape(F.stack([rotated_even, rotated_odd], -1), q.shape)
+    return F.reshape(F.stack([rotated_even, rotated_odd], -1), list(shape))
 
 
 def rotary_cos_sin(rotary_embed, seq_len: int, batch: int = 1):
@@ -68,8 +69,7 @@ def rotary_cos_sin(rotary_embed, seq_len: int, batch: int = 1):
     return F.const(cos, list(cos.shape), F.NCHW, F.float), F.const(sin, list(sin.shape), F.NCHW, F.float)
 
 
-def mnn_attention(q, k, v, tokens: int):
-    mask = F.const(np.zeros((tokens, tokens), dtype=np.float32), [tokens, tokens], F.NCHW, F.float)
+def mnn_attention_single(q, k, v, mask):
     describe = json.dumps(
         {
             "type": "Attention",
@@ -80,23 +80,41 @@ def mnn_attention(q, k, v, tokens: int):
     return F.jsonop([q, k, v, mask], describe, 1)[0]
 
 
-def attention(attn, x, *, attention_op: str = "manual"):
+def mnn_attention(q, k, v, tokens: int, shape=None):
+    mask = F.const(np.zeros((tokens, tokens), dtype=np.float32), [tokens, tokens], F.NCHW, F.float)
+    batch, _, heads, head_dim = q.shape if shape is None else shape
+    if int(batch) == 1:
+        return mnn_attention_single(q, k, v, mask)
+    outputs = []
+    for index in range(int(batch)):
+        q_i = F.slice(q, [index, 0, 0, 0], [1, tokens, heads, head_dim])
+        k_i = F.slice(k, [index, 0, 0, 0], [1, tokens, heads, head_dim])
+        v_i = F.slice(v, [index, 0, 0, 0], [1, tokens, heads, head_dim])
+        outputs.append(mnn_attention_single(q_i, k_i, v_i, mask))
+    return F.concat(outputs, 0)
+
+
+def attention(attn, x, *, attention_op: str = "manual", input_shape=None):
+    if input_shape is None:
+        batch, tokens, _ = x.shape
+    else:
+        batch, tokens, _ = input_shape
     x_norm = rms_norm(x, attn.norm.gamma)
     qkv = linear(x_norm, attn.to_qkv)
-    batch, tokens, _ = qkv.shape
     heads = int(attn.heads)
-    head_dim = int(qkv.shape[-1] // (3 * heads))
+    head_dim = int(attn.to_qkv.weight.shape[0] // (3 * heads))
     qkv = F.reshape(qkv, [batch, tokens, 3, heads, head_dim])
     q = F.squeeze(F.slice(qkv, [0, 0, 0, 0, 0], [batch, tokens, 1, heads, head_dim]), [2])
     k = F.squeeze(F.slice(qkv, [0, 0, 1, 0, 0], [batch, tokens, 1, heads, head_dim]), [2])
     v = F.squeeze(F.slice(qkv, [0, 0, 2, 0, 0], [batch, tokens, 1, heads, head_dim]), [2])
     if attn.rotary_embed is not None:
         cos, sin = rotary_cos_sin(attn.rotary_embed, tokens, batch=batch)
-        q = rotate_half(q, cos, sin)
-        k = rotate_half(k, cos, sin)
+        qkv_shape = [batch, tokens, heads, head_dim]
+        q = rotate_half(q, cos, sin, qkv_shape)
+        k = rotate_half(k, cos, sin, qkv_shape)
 
     if attention_op == "mnn":
-        out = F.reshape(mnn_attention(q, k, v, tokens), [batch, tokens, heads, head_dim])
+        out = F.reshape(mnn_attention(q, k, v, tokens, [batch, tokens, heads, head_dim]), [batch, tokens, heads, head_dim])
     elif attention_op == "manual":
         q = F.transpose(q, [0, 2, 1, 3])
         k = F.transpose(k, [0, 2, 1, 3])
@@ -120,10 +138,12 @@ def feed_forward(ff, x):
     return linear(x, net[4])
 
 
-def transformer(module, x, *, attention_op: str = "manual"):
+def transformer(module, x, *, attention_op: str = "manual", shape=None):
+    shape = list(x.shape if shape is None else shape)
+    x = F.reshape(x, shape)
     for attn, ff in module.layers:
-        x = attention(attn, x, attention_op=attention_op) + x
-        x = feed_forward(ff, x) + x
+        x = F.reshape(attention(attn, x, attention_op=attention_op, input_shape=shape) + x, shape)
+        x = F.reshape(feed_forward(ff, x) + x, shape)
     if hasattr(module.norm, "gamma"):
         x = rms_norm(x, module.norm.gamma)
     return x
@@ -131,12 +151,14 @@ def transformer(module, x, *, attention_op: str = "manual"):
 
 def transformer_attention_block(module, x, *, attention_op: str = "manual"):
     attn, _ = module.layers[0]
-    return attention(attn, x, attention_op=attention_op) + x
+    shape = list(x.shape)
+    return F.reshape(attention(attn, x, attention_op=attention_op, input_shape=shape) + x, shape)
 
 
 def transformer_ffn_block(module, x):
     _, ff = module.layers[0]
-    x = feed_forward(ff, x) + x
+    shape = list(x.shape)
+    x = F.reshape(feed_forward(ff, x) + x, shape)
     if hasattr(module.norm, "gamma"):
         x = rms_norm(x, module.norm.gamma)
     return x
@@ -160,10 +182,10 @@ def roformer_block(model, start_layer: int, end_layer: int, x, *, attention_op: 
         time_transformer, freq_transformer = model.layers[layer_index]
         batch, frames, bands, dim = x.shape
         x = F.reshape(F.transpose(x, [0, 2, 1, 3]), [batch * bands, frames, dim])
-        x = transformer(time_transformer, x, attention_op=attention_op)
+        x = transformer(time_transformer, x, attention_op=attention_op, shape=[batch * bands, frames, dim])
         x = F.transpose(F.reshape(x, [batch, bands, frames, dim]), [0, 2, 1, 3])
         x = F.reshape(x, [batch * frames, bands, dim])
-        x = transformer(freq_transformer, x, attention_op=attention_op)
+        x = transformer(freq_transformer, x, attention_op=attention_op, shape=[batch * frames, bands, dim])
         x = F.reshape(x, [batch, frames, bands, dim])
     return x
 
@@ -181,13 +203,13 @@ def roformer_block_grouped(model, start_layer: int, end_layer: int, x, *, time_g
             actual = min(int(time_group_size), bands - band_start)
             group = F.slice(x, [0, 0, band_start, 0], [batch, frames, actual, dim])
             group = F.reshape(F.transpose(group, [0, 2, 1, 3]), [batch * actual, frames, dim])
-            group = transformer(time_transformer, group, attention_op=attention_op)
+            group = transformer(time_transformer, group, attention_op=attention_op, shape=[batch * actual, frames, dim])
             group = F.transpose(F.reshape(group, [batch, actual, frames, dim]), [0, 2, 1, 3])
             time_outputs.append(group)
         x = F.concat(time_outputs, 2)
 
         x = F.reshape(x, [batch * frames, bands, dim])
-        x = transformer(freq_transformer, x, attention_op=attention_op)
+        x = transformer(freq_transformer, x, attention_op=attention_op, shape=[batch * frames, bands, dim])
         x = F.reshape(x, [batch, frames, bands, dim])
     return x
 
@@ -203,7 +225,7 @@ def roformer_block_unrolled(model, start_layer: int, end_layer: int, x, *, freq_
         time_outputs = []
         for band_index in range(bands):
             band = F.squeeze(F.slice(x, [0, 0, band_index, 0], [batch, frames, 1, dim]), [2])
-            band = transformer(time_transformer, band, attention_op=attention_op)
+            band = transformer(time_transformer, band, attention_op=attention_op, shape=[batch, frames, dim])
             time_outputs.append(F.unsqueeze(band, 2))
         x = F.concat(time_outputs, 2)
 
@@ -212,7 +234,7 @@ def roformer_block_unrolled(model, start_layer: int, end_layer: int, x, *, freq_
             actual = min(int(freq_batch), frames - start)
             chunk = F.slice(x, [0, start, 0, 0], [batch, actual, bands, dim])
             chunk = F.reshape(chunk, [batch * actual, bands, dim])
-            chunk = transformer(freq_transformer, chunk, attention_op=attention_op)
+            chunk = transformer(freq_transformer, chunk, attention_op=attention_op, shape=[batch * actual, bands, dim])
             freq_outputs.append(F.reshape(chunk, [batch, actual, bands, dim]))
         x = F.concat(freq_outputs, 1)
     return x

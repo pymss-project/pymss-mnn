@@ -19,6 +19,7 @@ struct Args {
     mss_mnn::MNNPrecision precision = mss_mnn::MNNPrecision::Auto;
     mss_mnn::RoformerPrecisionPolicy precision_policy = mss_mnn::RoformerPrecisionPolicy::MetalFast;
     mss_mnn::RoformerSegmentCachePolicy segment_cache_policy = mss_mnn::RoformerSegmentCachePolicy::TransformersOnly;
+    mss_mnn::RoformerAttentionKernel attention_kernel = mss_mnn::RoformerAttentionKernel::Flash;
     int threads = 1;
     bool profile = false;
 };
@@ -29,7 +30,8 @@ void usage(const char* argv0) {
         << "--input input.wav --output-dir out [--backend cpu|auto|metal|opencl|vulkan] "
         << "[--precision auto|normal|high|low|low-bf16] "
         << "[--precision-policy uniform|metal-fast|metal-autocast] "
-        << "[--segment-cache all|transformers|blocks|none] [--threads 1] [--profile]\n";
+        << "[--segment-cache all|transformers|blocks|mask-heads|none] "
+        << "[--attention-kernel simple|flash] [--threads 1] [--profile]\n";
 }
 
 Args parse_args(int argc, char** argv) {
@@ -62,6 +64,8 @@ Args parse_args(int argc, char** argv) {
             args.precision_policy = mss_mnn::roformer_precision_policy_from_name(require_value(key));
         } else if (key == "--segment-cache") {
             args.segment_cache_policy = mss_mnn::roformer_segment_cache_policy_from_name(require_value(key));
+        } else if (key == "--attention-kernel") {
+            args.attention_kernel = mss_mnn::roformer_attention_kernel_from_name(require_value(key));
         } else if (key == "--threads") {
             args.threads = std::stoi(require_value(key));
         } else if (key == "--profile") {
@@ -100,6 +104,7 @@ int main(int argc, char** argv) {
         options.precision = args.precision;
         options.precision_policy = args.precision_policy;
         options.segment_cache_policy = args.segment_cache_policy;
+        options.attention_kernel = args.attention_kernel;
         options.threads = args.threads;
         options.profile = args.profile;
 
