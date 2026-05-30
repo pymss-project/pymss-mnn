@@ -130,17 +130,20 @@ python tools/mnn_export/export_expr_micro_segments.py \
 
 `--attention-op fmha_v2` replaces each transformer segment's
 `MatMul -> Softmax -> MatMul` attention with packed MNN `FmhaV2` ops and records
-`"attention_op": "fmha_v2"` in `manifest.json`. The C++ runtime reads the
-manifest and uses `--attention-kernel fused` by default, which maps to
-`Interpreter::ATTENTION_OPTION=16` for `layer_*` and `block_*` native-attention
-sessions. Pass `--attention-kernel simple|flash|fused` to choose
-`ATTENTION_OPTION=0`, `8`, or `16`.
+`"attention_op": "fmha_v2"` in `manifest.json`. The exporter feeds
+`qkv + cos + sin` to `FmhaV2`, so the forked backend can apply rotary while
+splitting Q/K/V instead of materializing graph-level slice/rotate/stack ops. The
+C++ runtime reads the manifest and uses `--attention-kernel fused` by default,
+which maps to `Interpreter::ATTENTION_OPTION=16` for `layer_*` and `block_*`
+native-attention sessions. Pass `--attention-kernel simple|flash|fused` to
+choose `ATTENTION_OPTION=0`, `8`, or `16`.
 
 The linked MNN SDK must be built with `-DMNN_SUPPORT_TRANSFORMER_FUSE=ON`.
 `--attention-kernel fused` additionally requires this repository's MNN fork,
-which adds a Metal `FmhaV2` backend wrapper and non-causal fused-attention fixes.
-An unmodified upstream MNN SDK can still run the older `--attention-op mnn`
-flash path with `--attention-kernel flash`.
+which adds a Metal `FmhaV2` backend wrapper, rotary-in-split support for Metal
+and OpenCL `FmhaV2`, and non-causal fused-attention fixes. An unmodified
+upstream MNN SDK can still run the older `--attention-op mnn` flash path with
+`--attention-kernel flash`.
 
 On Metal/Auto, split native-attention exports use the validated per-family
 policy. BSR-family `*_attn` sessions can run in `Normal`/FP16 while `*_ffn`
@@ -437,15 +440,22 @@ frame probes did not meet the same local target: `frames=256` exited abnormally
 at `peak memory footprint=3.17GB`, `frames=192` exited abnormally at `2.10GB`,
 and `frames=184` exited abnormally at `1.98GB` on the same test machine.
 
-The Expr `FmhaV2` f180 mask-core graph validates numerically, but it is not yet a
-speed win. The b12 core model is about `201 MiB`; on the same full `test.m4a`
-input it matched the segmented output exactly (`max_abs=0`, `rmse=0`) and cut
-`output_copy` from `93.72s` to `1.80s`, but `run_session` rose to `225.78s`.
-End-to-end time was `236.16s`, peak footprint was `1.42 GiB`, effectively tied
-with the segmented fused run (`231.51s`). This shows the previous
-`output_copy` bucket was mostly deferred Metal synchronization, not plain host
-copy. A b6 Expr core matched b12 on the 10-second output and had the same
-per-chunk runtime, so block size was not the cause.
+The Expr `FmhaV2` f180 mask-core graph became a speed win after moving rotary
+into the forked `FmhaV2` split kernel. The older b12 core model was about
+`201 MiB`; it matched segmented output exactly (`max_abs=0`, `rmse=0`) but ran
+the full `test.m4a` in `236.16s`, with `run_session=225.78s` and peak footprint
+`1.42 GiB`. The rotary-in-split b12 core model is `208 MiB` and also matches the
+older core and segmented full output exactly (`max_abs=0`, `rmse=0`). On the
+same M4 MacBook Air and `frames=180` shape it ran full `test_full.wav`
+(`311.61s`) in `194.09s` (`RTF=0.62`), with `run_session=183.62s`,
+`output_copy=1.76s`, and peak footprint `1.42 GiB`.
+
+The op-level profile for one f180 core chunk also moved in the expected
+direction: total MNN op time dropped from `2442.52ms` to `1776.57ms`; Raster
+calls dropped `585 -> 369`, Raster time `389.20ms -> 111.63ms`, BinaryOp calls
+`550 -> 454`, and While/MatMul-like calls `1124 -> 932`. A b6 Expr core matched
+b12 on the 10-second output and had the same per-chunk runtime before this
+kernel-level graph simplification, so block size was not the cause.
 
 The historical unsplit native-attention `freq_batch=16` probe was rejected:
 it ran `bsr_hyperace_voc` in `143.87s` but changed the 60-second vocals output

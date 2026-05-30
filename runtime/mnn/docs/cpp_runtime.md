@@ -150,10 +150,11 @@ category.
   `Interpreter::ATTENTION_OPTION=16` for RoFormer `layer_*` and `block_*`
   attention segments. Use `--attention-kernel simple|flash|fused` in the macOS
   CLI to select `ATTENTION_OPTION=0`, `8`, or `16`. The fused `FmhaV2` Metal path
-  is available when linking against this repository's MNN fork; upstream MNN
-  builds without that patch can still run `--attention-op mnn` with `flash`.
-  Unsplit native-attention transformer segments still run in `High` on
-  Metal/Auto.
+  is available when linking against this repository's MNN fork; that fork also
+  supports the exported `qkv + cos + sin` `FmhaV2` form that applies rotary while
+  splitting Q/K/V on Metal and OpenCL. Upstream MNN builds without that patch can
+  still run `--attention-op mnn` with `flash`. Unsplit native-attention
+  transformer segments still run in `High` on Metal/Auto.
 - Use the default `precision=Normal` for the current mobile-first path,
   `precision=Auto` with `precision_policy=MetalAutocast` for a more conservative
   split-segment policy, and `precision=High` only for targeted diagnostics.

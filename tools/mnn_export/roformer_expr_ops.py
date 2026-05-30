@@ -94,9 +94,8 @@ def mnn_attention(q, k, v, tokens: int, shape=None):
     return F.concat(outputs, 0)
 
 
-def mnn_fmha_v2(q, k, v, heads: int, shape=None):
-    batch, tokens, _, head_dim = q.shape if shape is None else shape
-    qkv = F.reshape(F.stack([q, k, v], 2), [batch, tokens, 3 * int(heads) * head_dim])
+def mnn_fmha_v2_packed(qkv, heads: int, cos=None, sin=None):
+    inputs = [qkv] if cos is None or sin is None else [qkv, cos, sin]
     describe = json.dumps(
         {
             "type": "FmhaV2",
@@ -104,7 +103,13 @@ def mnn_fmha_v2(q, k, v, heads: int, shape=None):
             "main": {"heads": int(heads)},
         }
     )
-    return F.jsonop([qkv], describe, 1)[0]
+    return F.jsonop(inputs, describe, 1)[0]
+
+
+def mnn_fmha_v2(q, k, v, heads: int, shape=None):
+    batch, tokens, _, head_dim = q.shape if shape is None else shape
+    qkv = F.reshape(F.stack([q, k, v], 2), [batch, tokens, 3 * int(heads) * head_dim])
+    return mnn_fmha_v2_packed(qkv, heads)
 
 
 def attention(attn, x, *, attention_op: str = "manual", input_shape=None):
@@ -116,6 +121,19 @@ def attention(attn, x, *, attention_op: str = "manual", input_shape=None):
     qkv = linear(x_norm, attn.to_qkv)
     heads = int(attn.heads)
     head_dim = int(attn.to_qkv.weight.shape[0] // (3 * heads))
+
+    if attention_op == "fmha_v2":
+        if attn.rotary_embed is not None:
+            cos, sin = rotary_cos_sin(attn.rotary_embed, tokens, batch=batch)
+            out = mnn_fmha_v2_packed(qkv, heads, cos, sin)
+        else:
+            out = mnn_fmha_v2_packed(qkv, heads)
+        out = F.reshape(out, [batch, tokens, heads, head_dim])
+        gates = F.sigmoid(linear(x_norm, attn.to_gates))
+        out = out * F.unsqueeze(gates, -1)
+        out = F.reshape(out, [batch, tokens, heads * head_dim])
+        return linear(out, attn.to_out[0])
+
     qkv = F.reshape(qkv, [batch, tokens, 3, heads, head_dim])
     q = F.squeeze(F.slice(qkv, [0, 0, 0, 0, 0], [batch, tokens, 1, heads, head_dim]), [2])
     k = F.squeeze(F.slice(qkv, [0, 0, 1, 0, 0], [batch, tokens, 1, heads, head_dim]), [2])
@@ -126,9 +144,7 @@ def attention(attn, x, *, attention_op: str = "manual", input_shape=None):
         q = rotate_half(q, cos, sin, qkv_shape)
         k = rotate_half(k, cos, sin, qkv_shape)
 
-    if attention_op == "fmha_v2":
-        out = F.reshape(mnn_fmha_v2(q, k, v, heads, [batch, tokens, heads, head_dim]), [batch, tokens, heads, head_dim])
-    elif attention_op == "mnn":
+    if attention_op == "mnn":
         out = F.reshape(mnn_attention(q, k, v, tokens, [batch, tokens, heads, head_dim]), [batch, tokens, heads, head_dim])
     elif attention_op == "manual":
         q = F.transpose(q, [0, 2, 1, 3])
