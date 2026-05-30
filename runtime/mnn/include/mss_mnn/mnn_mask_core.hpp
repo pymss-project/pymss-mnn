@@ -36,6 +36,9 @@ struct MaskCoreOptions {
     MNNPrecision precision = MNNPrecision::Auto;
     int threads = 1;
     int attention_option = 0;
+    bool profile_ops = false;
+    int profile_op_runs = 1;
+    int profile_op_top_n = 20;
 };
 
 struct MNNTensor {
@@ -56,6 +59,17 @@ struct MNNRunProfile {
     double input_copy_ms = 0.0;
     double run_ms = 0.0;
     double output_copy_ms = 0.0;
+    struct OpProfile {
+        std::string name;
+        std::string type;
+        std::string input_shapes;
+        std::string output_shapes;
+        double total_ms = 0.0;
+        int calls = 0;
+        float flops = 0.0f;
+    };
+    std::vector<OpProfile> ops;
+    std::vector<OpProfile> op_names;
 };
 
 class MNNModel {

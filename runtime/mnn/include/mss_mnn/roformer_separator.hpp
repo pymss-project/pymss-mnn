@@ -84,6 +84,8 @@ struct RoformerSeparatorOptions {
     RoformerAttentionKernel attention_kernel = RoformerAttentionKernel::Fused;
     int threads = 1;
     bool profile = false;
+    bool profile_ops = false;
+    int profile_op_top_n = 20;
 };
 
 RoformerMetadata load_roformer_metadata(const std::string& path);
@@ -101,6 +103,7 @@ public:
 
     std::vector<AudioBuffer> separate(const AudioBuffer& audio);
     const RoformerMetadata& metadata() const;
+    std::string last_profile_report() const;
 
 private:
     struct Impl;

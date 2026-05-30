@@ -12,6 +12,7 @@
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace mss_mnn {
 namespace {
@@ -63,6 +64,29 @@ void apply_session_hints(MNN::Interpreter& interpreter, int attention_option) {
     }
 }
 
+std::string tensor_shapes(const std::vector<MNN::Tensor*>& tensors) {
+    std::ostringstream stream;
+    stream << "[";
+    for (std::size_t i = 0; i < tensors.size(); ++i) {
+        if (i > 0) {
+            stream << ",";
+        }
+        stream << "[";
+        if (tensors[i]) {
+            const auto shape = tensors[i]->shape();
+            for (std::size_t d = 0; d < shape.size(); ++d) {
+                if (d > 0) {
+                    stream << "x";
+                }
+                stream << shape[d];
+            }
+        }
+        stream << "]";
+    }
+    stream << "]";
+    return stream.str();
+}
+
 }  // namespace
 
 struct MNNMaskCore::Impl {
@@ -71,6 +95,7 @@ struct MNNMaskCore::Impl {
     MNN::Session* session = nullptr;
     std::vector<int> input_shape;
     std::vector<int> output_shape;
+    int profiled_op_runs = 0;
 };
 
 struct InputMetadata {
@@ -308,7 +333,89 @@ std::vector<float> MNNMaskCore::run(const std::vector<float>& input, const std::
     }
 
     const auto run_start = std::chrono::steady_clock::now();
-    auto code = impl_->interpreter->runSession(impl_->session);
+    MNN::ErrorCode code = MNN::NO_ERROR;
+    const bool profile_ops = impl_->options.profile_ops && impl_->profiled_op_runs < impl_->options.profile_op_runs;
+    if (profile_ops) {
+        struct MutableOpProfile {
+            std::string name;
+            std::string type;
+            std::string input_shapes;
+            std::string output_shapes;
+            double total_ms = 0.0;
+            int calls = 0;
+            float flops = 0.0f;
+        };
+        std::unordered_map<std::string, MutableOpProfile> op_type_profiles;
+        std::unordered_map<std::string, MutableOpProfile> op_name_profiles;
+        auto op_start = std::chrono::steady_clock::now();
+        std::string current_input_shapes;
+        auto before = [&](const std::vector<MNN::Tensor*>& tensors, const MNN::OperatorInfo*) {
+            op_start = std::chrono::steady_clock::now();
+            if (impl_->options.profile_op_top_n > 0) {
+                current_input_shapes = tensor_shapes(tensors);
+            }
+            return true;
+        };
+        auto after = [&](const std::vector<MNN::Tensor*>& tensors, const MNN::OperatorInfo* info) {
+            const std::string type = info ? info->type() : "unknown";
+            const std::string name = info ? info->name() : "";
+            const double ms = elapsed_ms(op_start);
+            auto& type_item = op_type_profiles[type];
+            type_item.type = type;
+            type_item.total_ms += ms;
+            type_item.calls += 1;
+            if (info) {
+                type_item.flops += info->flops();
+            }
+            if (impl_->options.profile_op_top_n > 0) {
+                auto& name_item = op_name_profiles[type + "\n" + name];
+                name_item.type = type;
+                name_item.name = name.empty() ? "<unnamed>" : name;
+                if (name_item.input_shapes.empty()) {
+                    name_item.input_shapes = current_input_shapes;
+                    name_item.output_shapes = tensor_shapes(tensors);
+                }
+                name_item.total_ms += ms;
+                name_item.calls += 1;
+                if (info) {
+                    name_item.flops += info->flops();
+                }
+            }
+            return true;
+        };
+        code = impl_->interpreter->runSessionWithCallBackInfo(impl_->session, before, after, true);
+        ++impl_->profiled_op_runs;
+        local_profile.ops.reserve(op_type_profiles.size());
+        for (const auto& item : op_type_profiles) {
+            MNNRunProfile::OpProfile op;
+            op.type = item.second.type;
+            op.total_ms = item.second.total_ms;
+            op.calls = item.second.calls;
+            op.flops = item.second.flops;
+            local_profile.ops.push_back(std::move(op));
+        }
+        local_profile.op_names.reserve(op_name_profiles.size());
+        for (const auto& item : op_name_profiles) {
+            MNNRunProfile::OpProfile op;
+            op.name = item.second.name;
+            op.type = item.second.type;
+            op.input_shapes = item.second.input_shapes;
+            op.output_shapes = item.second.output_shapes;
+            op.total_ms = item.second.total_ms;
+            op.calls = item.second.calls;
+            op.flops = item.second.flops;
+            local_profile.op_names.push_back(std::move(op));
+        }
+        std::sort(local_profile.op_names.begin(), local_profile.op_names.end(), [](const auto& a, const auto& b) {
+            return a.total_ms > b.total_ms;
+        });
+        const auto top_n = static_cast<std::size_t>(std::max(0, impl_->options.profile_op_top_n));
+        if (local_profile.op_names.size() > top_n) {
+            local_profile.op_names.resize(top_n);
+        }
+    } else {
+        code = impl_->interpreter->runSession(impl_->session);
+    }
     local_profile.run_ms += elapsed_ms(run_start);
     if (code != 0) {
         throw std::runtime_error("MNN runSession failed");

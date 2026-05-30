@@ -47,12 +47,16 @@ public:
     }
 
     void add(const std::string& name, double ms) {
+        add(name, ms, 1);
+    }
+
+    void add(const std::string& name, double ms, int calls) {
         if (!enabled_) {
             return;
         }
         auto& counter = counters_[name];
         counter.total_ms += ms;
-        counter.calls += 1;
+        counter.calls += calls;
     }
 
     void add_mnn_run(const std::string& stage, const MNNRunProfile& profile) {
@@ -64,17 +68,26 @@ public:
         add("mnn." + stage + ".run_session", profile.run_ms);
         add("mnn." + stage + ".output_copy", profile.output_copy_ms);
         add("mnn." + stage + ".total", profile.resize_ms + profile.input_copy_ms + profile.run_ms + profile.output_copy_ms);
+        for (const auto& op : profile.ops) {
+            add("mnn." + stage + ".op_type." + op.type, op.total_ms, op.calls);
+        }
+        for (const auto& op : profile.op_names) {
+            add("mnn." + stage + ".op_name." + op.type + "." + op.name +
+                    " in=" + op.input_shapes + " out=" + op.output_shapes,
+                op.total_ms,
+                op.calls);
+        }
     }
 
-    void print(std::ostream& stream) const {
+    std::string report() const {
         if (!enabled_) {
-            return;
+            return "";
         }
-        std::fflush(nullptr);
         std::vector<std::pair<std::string, ProfileCounter>> items(counters_.begin(), counters_.end());
         std::sort(items.begin(), items.end(), [](const auto& a, const auto& b) {
             return a.second.total_ms > b.second.total_ms;
         });
+        std::ostringstream stream;
         stream << "\n[MSS MNN profile]\n";
         stream << std::left << std::setw(36) << "stage"
                << std::right << std::setw(12) << "total_ms"
@@ -88,6 +101,15 @@ public:
                    << std::setw(10) << counter.calls
                    << std::setw(12) << std::fixed << std::setprecision(2) << avg << "\n";
         }
+        return stream.str();
+    }
+
+    void print(std::ostream& stream) const {
+        if (!enabled_) {
+            return;
+        }
+        std::fflush(nullptr);
+        stream << report();
     }
 
 private:
@@ -633,6 +655,8 @@ public:
                    RoformerSegmentCachePolicy segment_cache_policy,
                    RoformerAttentionKernel attention_kernel,
                    int threads,
+                   bool profile_ops,
+                   int profile_op_top_n,
                    ProfileRecorder* profile)
         : segment_dir_(std::move(segment_dir)),
           manifest_(manifest),
@@ -644,6 +668,8 @@ public:
           segment_cache_policy_(segment_cache_policy),
           attention_kernel_(attention_kernel),
           threads_(threads),
+          profile_ops_(profile_ops),
+          profile_op_top_n_(profile_op_top_n),
           profile_(profile) {}
 
     std::vector<float> run(const std::string& name, const std::vector<float>& input, const std::vector<int>& shape) {
@@ -875,6 +901,8 @@ private:
         options.precision = segment_precision(name);
         options.threads = threads_;
         options.attention_option = segment_attention_option(name);
+        options.profile_ops = profile_ops_;
+        options.profile_op_top_n = profile_op_top_n_;
         return mss_mnn::MNNMaskCore(segment_dir_ + "/" + name + ".mnn", options);
     }
 
@@ -980,6 +1008,8 @@ private:
     RoformerSegmentCachePolicy segment_cache_policy_;
     RoformerAttentionKernel attention_kernel_;
     int threads_;
+    bool profile_ops_ = false;
+    int profile_op_top_n_ = 20;
     ProfileRecorder* profile_ = nullptr;
     std::unordered_map<std::string, mss_mnn::MNNMaskCore> runners_;
 };
@@ -1104,6 +1134,7 @@ struct RoformerSeparator::Impl {
     ProfileRecorder profile;
     std::unique_ptr<SegmentRuntime> runtime;
     std::unique_ptr<MNNMaskCore> core;
+    std::string last_profile_report;
 
     explicit Impl(RoformerSeparatorOptions opts)
         : options(std::move(opts)),
@@ -1117,6 +1148,9 @@ struct RoformerSeparator::Impl {
             core_options.precision = options.precision;
             core_options.threads = options.threads;
             core_options.attention_option = attention_option_value(options.attention_kernel);
+            core_options.profile_ops = options.profile_ops;
+            core_options.profile_op_runs = 1;
+            core_options.profile_op_top_n = options.profile_op_top_n;
             core = std::make_unique<MNNMaskCore>(options.core_model_path, core_options);
         } else {
             if (options.segment_dir.empty()) {
@@ -1133,6 +1167,8 @@ struct RoformerSeparator::Impl {
                                                        options.segment_cache_policy,
                                                        options.attention_kernel,
                                                        options.threads,
+                                                       options.profile_ops,
+                                                       options.profile_op_top_n,
                                                        &profile);
         }
     }
@@ -1222,12 +1258,17 @@ std::vector<AudioBuffer> RoformerSeparator::separate(const AudioBuffer& audio) {
         }
     }
     impl_->profile.add("total.separate", elapsed_ms(total_start));
+    impl_->last_profile_report = impl_->profile.report();
     impl_->profile.print(std::cerr);
     return outputs;
 }
 
 const RoformerMetadata& RoformerSeparator::metadata() const {
     return impl_->metadata;
+}
+
+std::string RoformerSeparator::last_profile_report() const {
+    return impl_->last_profile_report;
 }
 
 }  // namespace mss_mnn
