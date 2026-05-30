@@ -180,3 +180,7 @@ this RoFormer separator API.
 
 Offline conversion remains in `tools/mnn_export` and may depend on
 `pymss`/Torch/ONNX/PyMNN. Those dependencies are not part of the C++ runtime.
+The export tools use `MNNConvert` from `PATH` by default; set
+`MSS_MNN_CONVERT` or `MNNCONVERT` to point at this repository's forked converter
+when exporting native-attention Expr graphs that need the `RemoveInvalidCast`
+cleanup and forked `FmhaV2` support.

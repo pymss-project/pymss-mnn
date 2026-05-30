@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -19,6 +20,10 @@ from pymss.modules.bs_roformer.common import stft_roformer  # noqa: E402
 from pymss.separator import MSSeparator  # noqa: E402
 
 from tools.mnn_export.presets import RoformerMNNPreset  # noqa: E402
+
+
+def mnnconvert_binary() -> str:
+    return os.environ.get("MSS_MNN_CONVERT") or os.environ.get("MNNCONVERT") or "MNNConvert"
 
 
 class MaskCoreWrapper(torch.nn.Module):
@@ -209,7 +214,7 @@ def write_metadata(path: Path, preset: RoformerMNNPreset, separator: MSSeparator
 
 def run_mnnconvert(onnx_path: Path, mnn_path: Path, *, timeout_seconds: int = 1800, extra_args: list[str] | None = None) -> str:
     cmd = [
-        "MNNConvert",
+        mnnconvert_binary(),
         "-f",
         "ONNX",
         "--modelFile",

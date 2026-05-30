@@ -28,7 +28,13 @@ from tools.mnn_export.roformer_expr_ops import (  # noqa: E402
     transformer_attention_block,
     transformer_ffn_block,
 )
-from tools.mnn_export.roformer_mnn import build_separator, prepare_model_for_export, run_mnnconvert, write_metadata  # noqa: E402
+from tools.mnn_export.roformer_mnn import (  # noqa: E402
+    build_separator,
+    mnnconvert_binary,
+    prepare_model_for_export,
+    run_mnnconvert,
+    write_metadata,
+)
 
 
 class SegmWrapper(torch.nn.Module):
@@ -124,9 +130,9 @@ def parse_args():
     )
     parser.add_argument(
         "--attention-op",
-        choices=("manual", "mnn", "fmha_v2"),
+        choices=("manual", "mnn", "fmha_v2", "fmha_v2_gate"),
         default="fmha_v2",
-        help="Use legacy MatMul/Softmax, native MNN Attention, or packed FmhaV2 attention in transformer segments.",
+        help="Use legacy MatMul/Softmax, native MNN Attention, packed FmhaV2, or experimental packed qkv+gate FmhaV2 for the forked Metal backend.",
     )
     parser.add_argument(
         "--transformer-split",
@@ -174,9 +180,11 @@ def translate_json_ops(path: Path) -> None:
     raw_path = path.with_suffix(".jsonop.mnn")
     path.replace(raw_path)
     cmd = [
-        "MNNConvert",
+        mnnconvert_binary(),
         "-f",
         "MNN",
+        "--optimizeLevel",
+        "1",
         "--modelFile",
         str(raw_path),
         "--MNNModel",
@@ -203,7 +211,7 @@ def export_transformer(module, shape, path: Path, *, attention_op: str):
     x = F.placeholder(list(shape), F.NCHW, F.float)
     x.name = "input"
     y = transformer(module, x, attention_op=attention_op)
-    save_var(y, path, translate_json=attention_op in ("mnn", "fmha_v2"))
+    save_var(y, path, translate_json=attention_op in ("mnn", "fmha_v2", "fmha_v2_gate"))
     return list(y.shape) if y.shape is not None else list(shape)
 
 
@@ -211,7 +219,7 @@ def export_transformer_split(module, shape, path_prefix: Path, *, attention_op: 
     x = F.placeholder(list(shape), F.NCHW, F.float)
     x.name = "input"
     y = transformer_attention_block(module, x, attention_op=attention_op)
-    save_var(y, path_prefix.with_name(path_prefix.name + "_attn.mnn"), translate_json=attention_op in ("mnn", "fmha_v2"))
+    save_var(y, path_prefix.with_name(path_prefix.name + "_attn.mnn"), translate_json=attention_op in ("mnn", "fmha_v2", "fmha_v2_gate"))
 
     x = F.placeholder(list(shape), F.NCHW, F.float)
     x.name = "input"
@@ -259,7 +267,7 @@ def export_transformer_block(
             y = roformer_block_unrolled(model, start_layer, end_layer, x, freq_batch=freq_batch, attention_op=attention_op)
         else:
             raise ValueError(f"unsupported transformer block mode: {mode}")
-    save_var(y, path, translate_json=attention_op in ("mnn", "fmha_v2"))
+    save_var(y, path, translate_json=attention_op in ("mnn", "fmha_v2", "fmha_v2_gate"))
     return list(y.shape) if y.shape is not None else list(shape)
 
 
@@ -288,7 +296,7 @@ def export_core_model(
             freq_batch=freq_batch,
             mask_group_size=mask_group_size,
         )
-    save_var(y, path, translate_json=attention_op in ("mnn", "fmha_v2"), output_name="mask")
+    save_var(y, path, translate_json=attention_op in ("mnn", "fmha_v2", "fmha_v2_gate"), output_name="mask")
     batch, freq_channels, frames, complex_dim = list(input_shape)
     return [batch, len(model.mask_estimators), freq_channels, frames, complex_dim]
 
@@ -329,7 +337,7 @@ def main() -> None:
     mask_mode = str(getattr(model, "mask_mode", preset.mask_mode))
     if preset.input_shape[0] != 1:
         raise ValueError("HyperACE segm MNN export is validated with batch_size=1 only")
-    if args.transformer_split == "attention_ffn" and args.attention_op not in ("mnn", "fmha_v2"):
+    if args.transformer_split == "attention_ffn" and args.attention_op not in ("mnn", "fmha_v2", "fmha_v2_gate"):
         raise ValueError("--transformer-split attention_ffn is intended for native MNN attention ops")
     if args.transformer_block_size < 0:
         raise ValueError("--transformer-block-size must be >= 0")

@@ -69,6 +69,8 @@ with native `FmhaV2` attention. This path avoids the older ONNX full-core
 boundary and is the preferred larger-graph experiment for f180 mobile shapes:
 
 ```sh
+export MSS_MNN_CONVERT=/path/to/forked/MNNConvert
+
 python tools/mnn_export/export_expr_micro_segments.py \
   --preset bsr_hyperace_voc \
   --variant-name bsr_hyperace_voc_f180_fmha_b12_core \
@@ -456,6 +458,43 @@ calls dropped `585 -> 369`, Raster time `389.20ms -> 111.63ms`, BinaryOp calls
 `550 -> 454`, and While/MatMul-like calls `1124 -> 932`. A b6 Expr core matched
 b12 on the 10-second output and had the same per-chunk runtime before this
 kernel-level graph simplification, so block size was not the cause.
+
+Expr-saved `.mnn` files use `NetSource_CAFFE`, and MNN Expr can emit identity
+`Cast` nodes with `srcT=DT_INVALID` before float ops. Upstream
+`RemoveInvalidCast` skipped CAFFE nets entirely, so these casts survived normal
+`-f MNN` conversion. The forked converter now treats CAFFE nets when invalid
+source casts are present and propagates float types through RoFormer-relevant
+ops. `export_expr_micro_segments.py` runs this path with `-f MNN
+--optimizeLevel 1` whenever JSON ops need translation; set `MSS_MNN_CONVERT` or
+`MNNCONVERT` to select the forked binary.
+
+On the local f180 rotary core, the converter cleanup removed `713` Cast ops
+(`185.19ms/chunk` in the previous profile) without changing output. The patched
+converter output had `Cast=0`, `Raster=117.52ms / 369 calls`, and total op time
+`1620.08ms/chunk` on the same `timeProfile.out` command. The 10-second C++
+runner measured `mnn.core_model.run_session=1051.17ms/chunk`, max RSS
+`769507328` bytes, peak footprint `934675680` bytes, and produced byte-identical
+audio to the earlier cast-stripped reference.
+
+An experimental `--attention-op fmha_v2_gate` export packs `to_qkv` and
+`to_gates` into one projection and lets the forked Metal `FmhaV2` split kernel
+produce Q/K/V plus sigmoid gate. This removes 24 gate-projection `MatMul` nodes
+from the f180 BSR core (`MatMul 306 -> 282`, `UnaryOp 344 -> 320`) without
+adding graph-level `SliceTf` nodes and produced byte-identical 10-second audio
+against the regular `fmha_v2` core. It was still not a stable speed win on the
+local M4 MacBook Air: `timeProfile.out` moved only `1608.40ms -> 1601.45ms` per
+chunk, while C++ runner `run_session` measured `1056.80ms/chunk` for regular
+`fmha_v2` and `1066.22` / `1061.29ms/chunk` for packed qkvg. Peak footprint was
+slightly lower (`~924MB` vs `~934MB`). Keep `fmha_v2` as the default unless a
+target phone shows a repeatable memory/speed win for `fmha_v2_gate`.
+
+A postconvert `MatMul + const bias -> MatMul(input, weight, bias)` fusion was
+also tested and rejected for Metal Normal precision. It reduced profile op time
+(`1608.40ms -> 1542.76ms/chunk`) and 10-second `run_session`
+(`1056.80ms -> 1032.22ms/chunk`), but changed the audio output
+(`max_abs=0.02445`, `rmse=0.00422` against the regular f180 core). Do not enable
+this fusion on the release path unless the Metal MatMul-bias precision behavior
+is fixed and revalidated.
 
 The historical unsplit native-attention `freq_batch=16` probe was rejected:
 it ran `bsr_hyperace_voc` in `143.87s` but changed the 60-second vocals output

@@ -36,10 +36,29 @@ def const_tensor(tensor: torch.Tensor):
     return var
 
 
+def const_tensor_uncached(tensor: torch.Tensor):
+    array = tensor.detach().cpu().float().numpy()
+    return F.const(np.ascontiguousarray(array), list(array.shape), F.NCHW, F.float)
+
+
 def linear(x, module):
     y = F.matmul(x, const_tensor(module.weight), False, True)
     if module.bias is not None:
         y = y + const_tensor(module.bias)
+    return y
+
+
+def linear_concat(x, modules):
+    weight = torch.cat([module.weight for module in modules], dim=0)
+    y = F.matmul(x, const_tensor_uncached(weight), False, True)
+    if any(module.bias is not None for module in modules):
+        biases = []
+        for module in modules:
+            if module.bias is None:
+                biases.append(torch.zeros(module.weight.shape[0], dtype=module.weight.dtype, device=module.weight.device))
+            else:
+                biases.append(module.bias)
+        y = y + const_tensor_uncached(torch.cat(biases, dim=0))
     return y
 
 
@@ -94,8 +113,10 @@ def mnn_attention(q, k, v, tokens: int, shape=None):
     return F.concat(outputs, 0)
 
 
-def mnn_fmha_v2_packed(qkv, heads: int, cos=None, sin=None):
+def mnn_fmha_v2_packed(qkv, heads: int, cos=None, sin=None, gate=None):
     inputs = [qkv] if cos is None or sin is None else [qkv, cos, sin]
+    if gate is not None:
+        inputs.append(gate)
     describe = json.dumps(
         {
             "type": "FmhaV2",
@@ -118,18 +139,28 @@ def attention(attn, x, *, attention_op: str = "manual", input_shape=None):
     else:
         batch, tokens, _ = input_shape
     x_norm = rms_norm(x, attn.norm.gamma)
-    qkv = linear(x_norm, attn.to_qkv)
     heads = int(attn.heads)
     head_dim = int(attn.to_qkv.weight.shape[0] // (3 * heads))
 
+    if attention_op == "fmha_v2_gate":
+        qkv_gate = linear_concat(x_norm, [attn.to_qkv, attn.to_gates])
+        if attn.rotary_embed is not None:
+            cos, sin = rotary_cos_sin(attn.rotary_embed, tokens, batch=batch)
+            out = mnn_fmha_v2_packed(qkv_gate, heads, cos, sin)
+        else:
+            out = mnn_fmha_v2_packed(qkv_gate, heads)
+        out = F.reshape(out, [batch, tokens, heads * head_dim])
+        return linear(out, attn.to_out[0])
+
+    qkv = linear(x_norm, attn.to_qkv)
     if attention_op == "fmha_v2":
+        gates = F.sigmoid(linear(x_norm, attn.to_gates))
         if attn.rotary_embed is not None:
             cos, sin = rotary_cos_sin(attn.rotary_embed, tokens, batch=batch)
             out = mnn_fmha_v2_packed(qkv, heads, cos, sin)
         else:
             out = mnn_fmha_v2_packed(qkv, heads)
         out = F.reshape(out, [batch, tokens, heads, head_dim])
-        gates = F.sigmoid(linear(x_norm, attn.to_gates))
         out = out * F.unsqueeze(gates, -1)
         out = F.reshape(out, [batch, tokens, heads * head_dim])
         return linear(out, attn.to_out[0])
