@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 
@@ -105,6 +105,43 @@ def get_preset(name: str) -> RoformerMNNPreset:
         return PRESETS[name]
     except KeyError as exc:
         raise ValueError(f"unknown preset {name!r}; expected one of: {preset_names()}") from exc
+
+
+def apply_shape_overrides(
+    preset: RoformerMNNPreset,
+    *,
+    frames: int | None = None,
+    chunk_size: int | None = None,
+    overlap_size: int | None = None,
+    variant_name: str | None = None,
+) -> RoformerMNNPreset:
+    if frames is None and chunk_size is None and overlap_size is None and variant_name is None:
+        return preset
+    base_frames = int(preset.input_shape[2])
+    if base_frames <= 1:
+        raise ValueError(f"cannot infer hop length from input_shape {preset.input_shape}")
+    hop_length = max(1, int(round(preset.chunk_size / float(base_frames - 1))))
+    resolved_frames = int(frames) if frames is not None else int(chunk_size) // hop_length + 1
+    if resolved_frames <= 1:
+        raise ValueError("--frames must be > 1")
+    resolved_chunk_size = int(chunk_size) if chunk_size is not None else (resolved_frames - 1) * hop_length
+    if resolved_chunk_size <= 0:
+        raise ValueError("--chunk-size must be > 0")
+    if overlap_size is not None:
+        resolved_overlap_size = int(overlap_size)
+    else:
+        overlap_ratio = preset.overlap_size / float(max(1, preset.chunk_size))
+        resolved_overlap_size = int(round(resolved_chunk_size * overlap_ratio))
+    resolved_overlap_size = max(0, min(resolved_overlap_size, resolved_chunk_size - 1))
+    batch, freq_channels, _, complex_dim = preset.input_shape
+    resolved_variant_name = variant_name or f"{preset.name}_f{resolved_frames}"
+    return replace(
+        preset,
+        name=resolved_variant_name,
+        chunk_size=resolved_chunk_size,
+        overlap_size=resolved_overlap_size,
+        input_shape=(batch, freq_channels, resolved_frames, complex_dim),
+    )
 
 
 def default_out_dir() -> Path:

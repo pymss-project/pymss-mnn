@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from tools.mnn_export.presets import default_out_dir, get_preset, preset_names  # noqa: E402
+from tools.mnn_export.presets import apply_shape_overrides, default_out_dir, get_preset, preset_names  # noqa: E402
 from tools.mnn_export.roformer_mnn import (  # noqa: E402
     build_separator,
     patch_rotary_for_export,
@@ -29,12 +29,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-dir", type=Path, default=default_out_dir())
     parser.add_argument("--seed", type=int, default=1145)
     parser.add_argument("--convert-timeout", type=int, default=2400)
+    parser.add_argument(
+        "--frames",
+        type=int,
+        default=None,
+        help="Override the fixed MNN STFT frame count for a mobile/lower-memory export.",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=None,
+        help="Override metadata/inference chunk size. If --frames is omitted, frames are derived from this value.",
+    )
+    parser.add_argument("--overlap-size", type=int, default=None, help="Override metadata/inference overlap size.")
+    parser.add_argument("--variant-name", default=None, help="Output preset name for custom shape exports.")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    preset = get_preset(args.preset)
+    preset = apply_shape_overrides(
+        get_preset(args.preset),
+        frames=args.frames,
+        chunk_size=args.chunk_size,
+        overlap_size=args.overlap_size,
+        variant_name=args.variant_name,
+    )
     out_dir = args.out_dir / preset.name
     out_dir.mkdir(parents=True, exist_ok=True)
 

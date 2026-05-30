@@ -94,6 +94,19 @@ def mnn_attention(q, k, v, tokens: int, shape=None):
     return F.concat(outputs, 0)
 
 
+def mnn_fmha_v2(q, k, v, heads: int, shape=None):
+    batch, tokens, _, head_dim = q.shape if shape is None else shape
+    qkv = F.reshape(F.stack([q, k, v], 2), [batch, tokens, 3 * int(heads) * head_dim])
+    describe = json.dumps(
+        {
+            "type": "FmhaV2",
+            "main_type": "FmhaV2Param",
+            "main": {"heads": int(heads)},
+        }
+    )
+    return F.jsonop([qkv], describe, 1)[0]
+
+
 def attention(attn, x, *, attention_op: str = "manual", input_shape=None):
     if input_shape is None:
         batch, tokens, _ = x.shape
@@ -113,7 +126,9 @@ def attention(attn, x, *, attention_op: str = "manual", input_shape=None):
         q = rotate_half(q, cos, sin, qkv_shape)
         k = rotate_half(k, cos, sin, qkv_shape)
 
-    if attention_op == "mnn":
+    if attention_op == "fmha_v2":
+        out = F.reshape(mnn_fmha_v2(q, k, v, heads, [batch, tokens, heads, head_dim]), [batch, tokens, heads, head_dim])
+    elif attention_op == "mnn":
         out = F.reshape(mnn_attention(q, k, v, tokens, [batch, tokens, heads, head_dim]), [batch, tokens, heads, head_dim])
     elif attention_op == "manual":
         q = F.transpose(q, [0, 2, 1, 3])
@@ -177,10 +192,10 @@ def band_split(model, stft_repr):
     return F.stack(outs, 2)
 
 
-def roformer_block(model, start_layer: int, end_layer: int, x, *, attention_op: str = "manual"):
+def roformer_block(model, start_layer: int, end_layer: int, x, *, attention_op: str = "manual", shape=None):
+    batch, frames, bands, dim = list(x.shape if shape is None else shape)
     for layer_index in range(start_layer, end_layer):
         time_transformer, freq_transformer = model.layers[layer_index]
-        batch, frames, bands, dim = x.shape
         x = F.reshape(F.transpose(x, [0, 2, 1, 3]), [batch * bands, frames, dim])
         x = transformer(time_transformer, x, attention_op=attention_op, shape=[batch * bands, frames, dim])
         x = F.transpose(F.reshape(x, [batch, bands, frames, dim]), [0, 2, 1, 3])
@@ -190,13 +205,13 @@ def roformer_block(model, start_layer: int, end_layer: int, x, *, attention_op: 
     return x
 
 
-def roformer_block_grouped(model, start_layer: int, end_layer: int, x, *, time_group_size: int, attention_op: str = "manual"):
+def roformer_block_grouped(model, start_layer: int, end_layer: int, x, *, time_group_size: int, attention_op: str = "manual", shape=None):
     if int(time_group_size) < 1:
         raise ValueError("time_group_size must be >= 1")
 
+    batch, frames, bands, dim = list(x.shape if shape is None else shape)
     for layer_index in range(start_layer, end_layer):
         time_transformer, freq_transformer = model.layers[layer_index]
-        batch, frames, bands, dim = x.shape
 
         time_outputs = []
         for band_start in range(0, bands, int(time_group_size)):
@@ -214,13 +229,13 @@ def roformer_block_grouped(model, start_layer: int, end_layer: int, x, *, time_g
     return x
 
 
-def roformer_block_unrolled(model, start_layer: int, end_layer: int, x, *, freq_batch: int, attention_op: str = "manual"):
+def roformer_block_unrolled(model, start_layer: int, end_layer: int, x, *, freq_batch: int, attention_op: str = "manual", shape=None):
     if int(freq_batch) < 1:
         raise ValueError("freq_batch must be >= 1")
 
+    batch, frames, bands, dim = list(x.shape if shape is None else shape)
     for layer_index in range(start_layer, end_layer):
         time_transformer, freq_transformer = model.layers[layer_index]
-        batch, frames, bands, dim = x.shape
 
         time_outputs = []
         for band_index in range(bands):
@@ -240,42 +255,110 @@ def roformer_block_unrolled(model, start_layer: int, end_layer: int, x, *, freq_
     return x
 
 
-def mask_estimator_band(estimator, x, band_index: int):
+def mask_estimator_band(estimator, x, band_index: int, shape=None):
     mlp_with_glu = estimator.to_freqs[band_index]
+    batch, frames, _ = list(x.shape if shape is None else shape)
     band = x
+    out_features = None
     for layer in mlp_with_glu[0]:
         if isinstance(layer, torch.nn.Linear):
             band = linear(band, layer)
+            out_features = int(layer.weight.shape[0])
         elif isinstance(layer, torch.nn.Tanh):
             band = F.tanh(band)
         else:
             raise TypeError(f"unsupported mask MLP layer: {type(layer).__name__}")
-    half = band.shape[-1] // 2
-    value = F.slice(band, [0, 0, 0], [x.shape[0], x.shape[1], half])
-    gate = F.slice(band, [0, 0, half], [x.shape[0], x.shape[1], half])
+    half = (out_features if out_features is not None else band.shape[-1]) // 2
+    value = F.slice(band, [0, 0, 0], [batch, frames, half])
+    gate = F.slice(band, [0, 0, half], [batch, frames, half])
     return value * F.sigmoid(gate)
 
 
-def mask_band(model, band_index: int, x):
+def mask_band(model, band_index: int, x, shape=None):
+    shape = list(x.shape if shape is None else shape)
     if hasattr(model.final_norm, "gamma"):
         x = rms_norm(x, model.final_norm.gamma)
-    masks = [mask_estimator_band(estimator, x, band_index) for estimator in model.mask_estimators]
+    masks = [mask_estimator_band(estimator, x, band_index, shape=shape) for estimator in model.mask_estimators]
     return F.stack(masks, 1)
 
 
-def mask_band_group(model, band_start: int, band_count: int, x):
+def mask_band_group(model, band_start: int, band_count: int, x, shape=None):
     if hasattr(model.final_norm, "gamma"):
         gamma = model.final_norm.gamma
     else:
         gamma = None
 
     outputs = []
-    batch, frames, _, dim = x.shape
+    batch, frames, _, dim = list(x.shape if shape is None else shape)
     for local_index in range(band_count):
         band_index = band_start + local_index
         band = F.squeeze(F.slice(x, [0, 0, local_index, 0], [batch, frames, 1, dim]), [2])
+        band = F.reshape(band, [batch, frames, dim])
         if gamma is not None:
             band = rms_norm(band, gamma)
-        masks = [mask_estimator_band(estimator, band, band_index) for estimator in model.mask_estimators]
+        masks = [mask_estimator_band(estimator, band, band_index, shape=[batch, frames, dim]) for estimator in model.mask_estimators]
         outputs.append(F.stack(masks, 1))
     return F.concat(outputs, -1)
+
+
+def mask_core(
+    model,
+    stft_repr,
+    *,
+    attention_op: str,
+    transformer_block_size: int,
+    transformer_block_mode: str,
+    transformer_block_time_group_size: int,
+    freq_batch: int,
+    mask_group_size: int,
+):
+    mask_mode = str(getattr(model, "mask_mode", "no_segm"))
+    if mask_mode != "no_segm":
+        raise ValueError("Expr mask-core export currently supports mask_mode=no_segm only")
+
+    batch, _, frames, _ = list(stft_repr.shape)
+    bands = len(model.band_split.dim_inputs)
+    dim = int(model.layers[0][0].layers[0][0].norm.gamma.numel())
+    band_shape = [batch, frames, bands, dim]
+
+    x = F.reshape(band_split(model, stft_repr), band_shape)
+    depth = len(model.layers)
+    block_size = int(transformer_block_size) if int(transformer_block_size) > 0 else depth
+    for start_layer in range(0, depth, block_size):
+        end_layer = min(start_layer + block_size, depth)
+        if transformer_block_mode == "grouped":
+            x = roformer_block_grouped(
+                model,
+                start_layer,
+                end_layer,
+                x,
+                time_group_size=transformer_block_time_group_size,
+                attention_op=attention_op,
+                shape=band_shape,
+            )
+        elif transformer_block_mode == "batched":
+            x = roformer_block(model, start_layer, end_layer, x, attention_op=attention_op, shape=band_shape)
+        elif transformer_block_mode == "unrolled":
+            x = roformer_block_unrolled(model, start_layer, end_layer, x, freq_batch=freq_batch, attention_op=attention_op, shape=band_shape)
+        else:
+            raise ValueError(f"unsupported transformer block mode: {transformer_block_mode}")
+        x = F.reshape(x, band_shape)
+
+    flat_outputs = []
+    group_size = max(1, int(mask_group_size))
+    if group_size == 1:
+        for band_index in range(bands):
+            band = F.squeeze(F.slice(x, [0, 0, band_index, 0], [batch, frames, 1, dim]), [2])
+            band = F.reshape(band, [batch, frames, dim])
+            flat_outputs.append(mask_band(model, band_index, band, shape=[batch, frames, dim]))
+    else:
+        for band_start in range(0, bands, group_size):
+            band_count = min(group_size, bands - band_start)
+            group = F.slice(x, [0, 0, band_start, 0], [batch, frames, band_count, dim])
+            group = F.reshape(group, [batch, frames, band_count, dim])
+            flat_outputs.append(mask_band_group(model, band_start, band_count, group, shape=[batch, frames, band_count, dim]))
+
+    flat = F.concat(flat_outputs, -1)
+    stems = len(model.mask_estimators)
+    flat_dim = sum(int(value) for value in model.band_split.dim_inputs)
+    return F.transpose(F.reshape(flat, [batch, stems, frames, flat_dim // 2, 2]), [0, 1, 3, 2, 4])

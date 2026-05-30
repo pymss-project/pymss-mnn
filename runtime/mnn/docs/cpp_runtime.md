@@ -69,9 +69,9 @@ mss_mnn::RoformerSeparatorOptions options;
 options.segment_dir = "expr_micro_segments";
 options.metadata_path = "bsr_hyperace_voc_metadata.json";
 options.backend = mss_mnn::MNNBackend::CPU;
-options.precision = mss_mnn::MNNPrecision::Auto;
+options.precision = mss_mnn::MNNPrecision::Normal;
 options.precision_policy = mss_mnn::RoformerPrecisionPolicy::MetalFast;
-options.segment_cache_policy = mss_mnn::RoformerSegmentCachePolicy::TransformersOnly;
+options.segment_cache_policy = mss_mnn::RoformerSegmentCachePolicy::Auto;
 options.threads = 1;
 
 mss_mnn::RoformerSeparator separator(options);
@@ -104,7 +104,7 @@ precision to every segment, `MetalFast` keeps the mobile-first minimum high
 precision set, and `MetalAutocast` raises additional mask segments for tighter
 CPU/Metal parity.
 `RoformerSegmentCachePolicy` controls how many micro-segment sessions stay
-resident: `All` is fastest, `BlocksOnly` caches `block_*.mnn` plus
+resident: `Auto` is the mobile-first default, `All` is fastest, `BlocksOnly` caches `block_*.mnn` plus
 `band_split`, `MaskHeadsOnly` caches `band_split` plus `mask_group_*`,
 `mask_band_*`, and `segm_*`, `TransformersOnly` caches legacy `layer_*`
 transformer segments plus grouped mask heads, and `None` disables the runtime
@@ -119,10 +119,9 @@ transformer and DSP pipeline unchanged.
 RoFormer manifests with `"transformer_block_size" > 0` use `block_*.mnn`
 segments for whole RoFormer layer blocks. This removes the host-side loop over
 thousands of small time/frequency transformer sessions. Block segments are kept
-resident by `segment_cache_policy=BlocksOnly` or `All`; the default
-`TransformersOnly` still loads one block at a time because a full set of
-fixed-shape block sessions can exceed low-memory targets on larger frame
-exports.
+resident by `segment_cache_policy=BlocksOnly` or `All`; `Auto` keeps coarse
+mobile block exports such as `transformer_block_size=6` resident, but avoids
+caching smaller block exports that can exceed low-memory targets.
 `MaskHeadsOnly` is the low-memory speed tradeoff for block exports: it avoids
 keeping large transformer blocks resident but reuses the smaller output-head
 sessions whose setup overhead is still visible on long audio.
@@ -133,31 +132,35 @@ The macOS CLI accepts `--profile` to print per-stage timing, including
 category.
 
 - macOS/iOS: use `CPU` for deterministic validation, `Metal` or `Auto` for
-  acceleration when the linked MNN SDK includes Metal. Generic `Auto` precision
-  uses `High` precision for `Metal` and `Auto` backends because normal precision
-  can introduce accumulated error on deep transformer models.
-- RoFormer `MetalFast` is the default when `precision=Auto`: it keeps the
-  smallest validated `High` set and leaves the rest in `Normal` to minimize GPU
-  memory and favor FP16 throughput on mobile. For native MNN `Attention`
+  acceleration when the linked MNN SDK includes Metal. RoFormer defaults to
+  `Normal` precision because the mobile path prioritizes FP16 throughput and the
+  local f180 block exports produced near-silent output when forced to `High`.
+- RoFormer `MetalFast` is applied when `precision=Auto`: it keeps the smallest
+  validated `High` set and leaves the rest in `Normal` to minimize GPU memory
+  and favor FP16 throughput on mobile. For native MNN `Attention`
   manifests exported as split `attention_ffn` segments, BSR-family `_attn`
   sessions run in `Normal` while `_ffn` stays `High`; MelBandRoFormer `_attn`
   sessions are forced to `High` because FP16 attention accumulates too much
-  error end to end.
-- Native MNN `Attention` segments require an MNN SDK built with
-  `-DMNN_SUPPORT_TRANSFORMER_FUSE=ON`. The runtime sets
-  `Interpreter::ATTENTION_OPTION=8` for RoFormer `layer_*` and `block_*`
-  attention segments whose manifest has `"attention_op": "mnn"` by default. Use
-  `--attention-kernel simple|flash` in the macOS CLI to select
-  `ATTENTION_OPTION=0` or `8`. MNN's current Metal fused path is not exposed
-  because it needs SDK source changes for correct non-causal RoFormer attention.
+  error end to end. Block exports run in `Normal` by default on Metal because
+  local f180 validation showed explicit `High` block sessions can produce
+  near-silent output.
+- Native MNN `Attention`/`FmhaV2` segments require an MNN SDK built with
+  `-DMNN_SUPPORT_TRANSFORMER_FUSE=ON`. The default segmented exporter now emits
+  `"attention_op": "fmha_v2"` and the runtime sets
+  `Interpreter::ATTENTION_OPTION=16` for RoFormer `layer_*` and `block_*`
+  attention segments. Use `--attention-kernel simple|flash|fused` in the macOS
+  CLI to select `ATTENTION_OPTION=0`, `8`, or `16`. The fused `FmhaV2` Metal path
+  is available when linking against this repository's MNN fork; upstream MNN
+  builds without that patch can still run `--attention-op mnn` with `flash`.
   Unsplit native-attention transformer segments still run in `High` on
   Metal/Auto.
-- Use `precision=Normal` with `precision_policy=Uniform` for the absolute
-  lowest-memory run, `precision_policy=MetalAutocast` for a better quality/speed
-  tradeoff, and `precision=High` for a full high-precision reference run.
-- Use `segment_cache_policy=MaskHeadsOnly` for the mobile-first middle ground on
-  block exports. Switch to `All` for maximum throughput; use `None` only when
-  profiling a target backend.
+- Use the default `precision=Normal` for the current mobile-first path,
+  `precision=Auto` with `precision_policy=MetalAutocast` for a more conservative
+  split-segment policy, and `precision=High` only for targeted diagnostics.
+- Use `segment_cache_policy=Auto` with `transformer_block_size=6` for the
+  current mobile-first default. Switch to `All` for maximum throughput,
+  `MaskHeadsOnly` for lower memory, or `None` only when profiling a target
+  backend.
 - Android: use `CPU` for fallback, `OpenCL`, `Vulkan`, or `Auto` when the SDK and
   device support those backends.
 

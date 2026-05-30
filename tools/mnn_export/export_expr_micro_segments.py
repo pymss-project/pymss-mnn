@@ -5,7 +5,6 @@ import argparse
 import json
 import subprocess
 import sys
-from dataclasses import replace
 from pathlib import Path
 
 import MNN.expr as F
@@ -15,10 +14,11 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from tools.mnn_export.presets import default_out_dir, get_preset, preset_names  # noqa: E402
+from tools.mnn_export.presets import apply_shape_overrides, default_out_dir, get_preset, preset_names  # noqa: E402
 from tools.mnn_export.roformer_expr_ops import (  # noqa: E402
     band_split,
     const_cache,
+    mask_core,
     mask_band,
     mask_band_group,
     roformer_block,
@@ -115,7 +115,7 @@ def parse_args():
         help="Batch independent time-transformer band sequences. Keep 1 for validated Metal exports.",
     )
     parser.add_argument("--freq-batch", type=int, default=16)
-    parser.add_argument("--only", choices=("all", "transformers", "mask_bands", "segm", "manifest"), default="all")
+    parser.add_argument("--only", choices=("all", "transformers", "mask_bands", "segm", "manifest", "core_model"), default="all")
     parser.add_argument(
         "--mask-group-size",
         type=int,
@@ -124,9 +124,9 @@ def parse_args():
     )
     parser.add_argument(
         "--attention-op",
-        choices=("manual", "mnn"),
-        default="manual",
-        help="Use legacy MatMul/Softmax attention or native MNN Attention in transformer segments.",
+        choices=("manual", "mnn", "fmha_v2"),
+        default="fmha_v2",
+        help="Use legacy MatMul/Softmax, native MNN Attention, or packed FmhaV2 attention in transformer segments.",
     )
     parser.add_argument(
         "--transformer-split",
@@ -137,8 +137,8 @@ def parse_args():
     parser.add_argument(
         "--transformer-block-size",
         type=int,
-        default=0,
-        help="Export whole RoFormer layer blocks as MNN Expr segments. 0 keeps legacy per time/freq transformer segments.",
+        default=6,
+        help="Export whole RoFormer layer blocks as MNN Expr segments. 6 is the mobile-first default; 0 keeps legacy per time/freq transformer segments.",
     )
     parser.add_argument(
         "--transformer-block-mode",
@@ -170,36 +170,6 @@ def parse_args():
     return parser.parse_args()
 
 
-def apply_shape_overrides(preset, args):
-    if args.frames is None and args.chunk_size is None and args.overlap_size is None and args.variant_name is None:
-        return preset
-    base_frames = int(preset.input_shape[2])
-    if base_frames <= 1:
-        raise ValueError(f"cannot infer hop length from input_shape {preset.input_shape}")
-    hop_length = max(1, int(round(preset.chunk_size / float(base_frames - 1))))
-    frames = int(args.frames) if args.frames is not None else int(args.chunk_size) // hop_length + 1
-    if frames <= 1:
-        raise ValueError("--frames must be > 1")
-    chunk_size = int(args.chunk_size) if args.chunk_size is not None else (frames - 1) * hop_length
-    if chunk_size <= 0:
-        raise ValueError("--chunk-size must be > 0")
-    if args.overlap_size is not None:
-        overlap_size = int(args.overlap_size)
-    else:
-        overlap_ratio = preset.overlap_size / float(max(1, preset.chunk_size))
-        overlap_size = int(round(chunk_size * overlap_ratio))
-    overlap_size = max(0, min(overlap_size, chunk_size - 1))
-    batch, freq_channels, _, complex_dim = preset.input_shape
-    variant_name = args.variant_name or f"{preset.name}_f{frames}"
-    return replace(
-        preset,
-        name=variant_name,
-        chunk_size=chunk_size,
-        overlap_size=overlap_size,
-        input_shape=(batch, freq_channels, frames, complex_dim),
-    )
-
-
 def translate_json_ops(path: Path) -> None:
     raw_path = path.with_suffix(".jsonop.mnn")
     path.replace(raw_path)
@@ -221,9 +191,9 @@ def translate_json_ops(path: Path) -> None:
     raw_path.unlink(missing_ok=True)
 
 
-def save_var(var, path: Path, *, translate_json: bool = False) -> None:
+def save_var(var, path: Path, *, translate_json: bool = False, output_name: str = "output") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    var.name = "output"
+    var.name = output_name
     F.save([var], str(path))
     if translate_json:
         translate_json_ops(path)
@@ -233,7 +203,7 @@ def export_transformer(module, shape, path: Path, *, attention_op: str):
     x = F.placeholder(list(shape), F.NCHW, F.float)
     x.name = "input"
     y = transformer(module, x, attention_op=attention_op)
-    save_var(y, path, translate_json=attention_op == "mnn")
+    save_var(y, path, translate_json=attention_op in ("mnn", "fmha_v2"))
     return list(y.shape) if y.shape is not None else list(shape)
 
 
@@ -241,7 +211,7 @@ def export_transformer_split(module, shape, path_prefix: Path, *, attention_op: 
     x = F.placeholder(list(shape), F.NCHW, F.float)
     x.name = "input"
     y = transformer_attention_block(module, x, attention_op=attention_op)
-    save_var(y, path_prefix.with_name(path_prefix.name + "_attn.mnn"), translate_json=attention_op == "mnn")
+    save_var(y, path_prefix.with_name(path_prefix.name + "_attn.mnn"), translate_json=attention_op in ("mnn", "fmha_v2"))
 
     x = F.placeholder(list(shape), F.NCHW, F.float)
     x.name = "input"
@@ -289,8 +259,38 @@ def export_transformer_block(
             y = roformer_block_unrolled(model, start_layer, end_layer, x, freq_batch=freq_batch, attention_op=attention_op)
         else:
             raise ValueError(f"unsupported transformer block mode: {mode}")
-    save_var(y, path, translate_json=attention_op == "mnn")
+    save_var(y, path, translate_json=attention_op in ("mnn", "fmha_v2"))
     return list(y.shape) if y.shape is not None else list(shape)
+
+
+def export_core_model(
+    model,
+    input_shape,
+    path: Path,
+    *,
+    attention_op: str,
+    transformer_block_size: int,
+    transformer_block_mode: str,
+    transformer_block_time_group_size: int,
+    freq_batch: int,
+    mask_group_size: int,
+):
+    x = F.placeholder(list(input_shape), F.NCHW, F.float)
+    x.name = "stft_repr"
+    with const_cache():
+        y = mask_core(
+            model,
+            x,
+            attention_op=attention_op,
+            transformer_block_size=transformer_block_size,
+            transformer_block_mode=transformer_block_mode,
+            transformer_block_time_group_size=transformer_block_time_group_size,
+            freq_batch=freq_batch,
+            mask_group_size=mask_group_size,
+        )
+    save_var(y, path, translate_json=attention_op in ("mnn", "fmha_v2"), output_name="mask")
+    batch, freq_channels, frames, complex_dim = list(input_shape)
+    return [batch, len(model.mask_estimators), freq_channels, frames, complex_dim]
 
 
 def export_segm(model, stem_index: int, shape, out_dir: Path):
@@ -316,15 +316,21 @@ def export_segm(model, stem_index: int, shape, out_dir: Path):
 
 def main() -> None:
     args = parse_args()
-    preset = apply_shape_overrides(get_preset(args.preset), args)
+    preset = apply_shape_overrides(
+        get_preset(args.preset),
+        frames=args.frames,
+        chunk_size=args.chunk_size,
+        overlap_size=args.overlap_size,
+        variant_name=args.variant_name,
+    )
     out_dir = args.out_dir / preset.name / "expr_micro_segments"
     separator = build_separator(preset, batch_size=preset.input_shape[0], device="cpu")
     model = prepare_model_for_export(separator.model.cpu())
     mask_mode = str(getattr(model, "mask_mode", preset.mask_mode))
     if preset.input_shape[0] != 1:
         raise ValueError("HyperACE segm MNN export is validated with batch_size=1 only")
-    if args.transformer_split == "attention_ffn" and args.attention_op != "mnn":
-        raise ValueError("--transformer-split attention_ffn is intended for --attention-op mnn")
+    if args.transformer_split == "attention_ffn" and args.attention_op not in ("mnn", "fmha_v2"):
+        raise ValueError("--transformer-split attention_ffn is intended for native MNN attention ops")
     if args.transformer_block_size < 0:
         raise ValueError("--transformer-block-size must be >= 0")
     if args.transformer_block_size and args.transformer_split != "fused":
@@ -345,6 +351,24 @@ def main() -> None:
     segm_output_shape = [batch, frames, sum(model.band_split.dim_inputs)]
     mask_shape = [batch, len(model.mask_estimators), freq_channels, frames, complex_dim]
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.only == "core_model":
+        core_path = out_dir.parent / f"{preset.name}_expr_mask_core.mnn"
+        output_shape = export_core_model(
+            model,
+            preset.input_shape,
+            core_path,
+            attention_op=args.attention_op,
+            transformer_block_size=args.transformer_block_size,
+            transformer_block_mode=args.transformer_block_mode,
+            transformer_block_time_group_size=args.transformer_block_time_group_size,
+            freq_batch=args.freq_batch,
+            mask_group_size=args.mask_group_size,
+        )
+        write_metadata(out_dir.parent / f"{preset.name}_metadata.json", preset, separator, tuple(output_shape), compact=False)
+        print(core_path)
+        separator.del_cache()
+        return
 
     if args.only == "manifest":
         exported = scan_exported_segments(out_dir)

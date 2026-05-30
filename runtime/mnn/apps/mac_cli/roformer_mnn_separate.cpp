@@ -16,10 +16,10 @@ struct Args {
     std::string input_wav;
     std::string output_dir;
     mss_mnn::MNNBackend backend = mss_mnn::MNNBackend::CPU;
-    mss_mnn::MNNPrecision precision = mss_mnn::MNNPrecision::Auto;
+    mss_mnn::MNNPrecision precision = mss_mnn::MNNPrecision::Normal;
     mss_mnn::RoformerPrecisionPolicy precision_policy = mss_mnn::RoformerPrecisionPolicy::MetalFast;
-    mss_mnn::RoformerSegmentCachePolicy segment_cache_policy = mss_mnn::RoformerSegmentCachePolicy::TransformersOnly;
-    mss_mnn::RoformerAttentionKernel attention_kernel = mss_mnn::RoformerAttentionKernel::Flash;
+    mss_mnn::RoformerSegmentCachePolicy segment_cache_policy = mss_mnn::RoformerSegmentCachePolicy::Auto;
+    mss_mnn::RoformerAttentionKernel attention_kernel = mss_mnn::RoformerAttentionKernel::Fused;
     int threads = 1;
     bool profile = false;
 };
@@ -30,8 +30,8 @@ void usage(const char* argv0) {
         << "--input input.wav --output-dir out [--backend cpu|auto|metal|opencl|vulkan] "
         << "[--precision auto|normal|high|low|low-bf16] "
         << "[--precision-policy uniform|metal-fast|metal-autocast] "
-        << "[--segment-cache all|transformers|blocks|mask-heads|none] "
-        << "[--attention-kernel simple|flash] [--threads 1] [--profile]\n";
+        << "[--segment-cache auto|all|transformers|blocks|mask-heads|none] "
+        << "[--attention-kernel simple|flash|fused] [--threads 1] [--profile]\n";
 }
 
 Args parse_args(int argc, char** argv) {

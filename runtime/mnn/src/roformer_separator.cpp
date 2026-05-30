@@ -335,6 +335,9 @@ RoformerSegmentCachePolicy roformer_segment_cache_policy_from_name(const std::st
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
         return static_cast<char>(std::tolower(c));
     });
+    if (value == "auto" || value == "default") {
+        return RoformerSegmentCachePolicy::Auto;
+    }
     if (value == "all") {
         return RoformerSegmentCachePolicy::All;
     }
@@ -355,6 +358,8 @@ RoformerSegmentCachePolicy roformer_segment_cache_policy_from_name(const std::st
 
 std::string roformer_segment_cache_policy_name(RoformerSegmentCachePolicy policy) {
     switch (policy) {
+        case RoformerSegmentCachePolicy::Auto:
+            return "auto";
         case RoformerSegmentCachePolicy::All:
             return "all";
         case RoformerSegmentCachePolicy::TransformersOnly:
@@ -366,7 +371,7 @@ std::string roformer_segment_cache_policy_name(RoformerSegmentCachePolicy policy
         case RoformerSegmentCachePolicy::None:
             return "none";
     }
-    return "all";
+    return "auto";
 }
 
 RoformerAttentionKernel roformer_attention_kernel_from_name(const std::string& name) {
@@ -380,6 +385,9 @@ RoformerAttentionKernel roformer_attention_kernel_from_name(const std::string& n
     if (value == "flash") {
         return RoformerAttentionKernel::Flash;
     }
+    if (value == "fused" || value == "flash-fused" || value == "fmha") {
+        return RoformerAttentionKernel::Fused;
+    }
     throw std::runtime_error("unknown RoFormer attention kernel: " + name);
 }
 
@@ -389,8 +397,22 @@ std::string roformer_attention_kernel_name(RoformerAttentionKernel kernel) {
             return "simple";
         case RoformerAttentionKernel::Flash:
             return "flash";
+        case RoformerAttentionKernel::Fused:
+            return "fused";
     }
-    return "flash";
+    return "fused";
+}
+
+int attention_option_value(RoformerAttentionKernel kernel) {
+    switch (kernel) {
+        case RoformerAttentionKernel::Simple:
+            return 0;
+        case RoformerAttentionKernel::Flash:
+            return 8;
+        case RoformerAttentionKernel::Fused:
+            return 16;
+    }
+    return 16;
 }
 
 std::vector<float> hann_window(int size) {
@@ -864,10 +886,13 @@ private:
     }
 
     bool should_cache(const std::string& name) const {
+        const RoformerSegmentCachePolicy policy = effective_cache_policy();
         if (has_prefix(name, "block_")) {
-            return segment_cache_policy_ == RoformerSegmentCachePolicy::All || segment_cache_policy_ == RoformerSegmentCachePolicy::BlocksOnly;
+            return policy == RoformerSegmentCachePolicy::All || policy == RoformerSegmentCachePolicy::BlocksOnly;
         }
-        switch (segment_cache_policy_) {
+        switch (policy) {
+            case RoformerSegmentCachePolicy::Auto:
+                return false;
             case RoformerSegmentCachePolicy::All:
                 return true;
             case RoformerSegmentCachePolicy::TransformersOnly:
@@ -883,9 +908,23 @@ private:
         return true;
     }
 
+    RoformerSegmentCachePolicy effective_cache_policy() const {
+        if (segment_cache_policy_ != RoformerSegmentCachePolicy::Auto) {
+            return segment_cache_policy_;
+        }
+        if (manifest_.transformer_block_size >= 6 && manifest_.transformer_block_count <= 2) {
+            return RoformerSegmentCachePolicy::All;
+        }
+        if (manifest_.transformer_block_size > 0) {
+            return RoformerSegmentCachePolicy::MaskHeadsOnly;
+        }
+        return RoformerSegmentCachePolicy::TransformersOnly;
+    }
+
     MNNPrecision segment_precision(const std::string& name) const {
         const bool metal_capable_backend = backend_ == MNNBackend::Metal || backend_ == MNNBackend::Auto;
-        if (metal_capable_backend && manifest_.attention_op == "mnn" && manifest_.transformer_split == "attention_ffn") {
+        const bool native_attention = manifest_.attention_op == "mnn" || manifest_.attention_op == "fmha_v2";
+        if (metal_capable_backend && native_attention && manifest_.transformer_split == "attention_ffn") {
             if (has_suffix(name, "_attn")) {
                 const bool force_high = precision_ == MNNPrecision::High || !supports_split_attention_fp16();
                 return force_high ? MNNPrecision::High : MNNPrecision::Normal;
@@ -894,11 +933,11 @@ private:
                 return MNNPrecision::High;
             }
         }
-        if (metal_capable_backend && manifest_.attention_op == "mnn" && has_prefix(name, "layer_")) {
+        if (metal_capable_backend && native_attention && has_prefix(name, "layer_")) {
             // Unsplit transformer segments accumulate too much FP16 error on Metal.
             return MNNPrecision::High;
         }
-        if (metal_capable_backend && has_prefix(name, "block_") && precision_ != MNNPrecision::Normal) {
+        if (metal_capable_backend && has_prefix(name, "block_") && precision_ == MNNPrecision::High) {
             return MNNPrecision::High;
         }
         const bool uses_segment_autocast = precision_policy_ == RoformerPrecisionPolicy::MetalFast ||
@@ -918,16 +957,17 @@ private:
     int segment_attention_option(const std::string& name) const {
         const bool native_attention_segment = has_prefix(name, "block_") ||
                                               (has_prefix(name, "layer_") && !has_suffix(name, "_ffn"));
-        if (manifest_.attention_op != "mnn" || !native_attention_segment) {
+        const bool native_attention = manifest_.attention_op == "mnn" || manifest_.attention_op == "fmha_v2";
+        if (!native_attention || !native_attention_segment) {
             return 0;
         }
         switch (attention_kernel_) {
             case RoformerAttentionKernel::Simple:
-                return 0;
             case RoformerAttentionKernel::Flash:
-                return 8;
+            case RoformerAttentionKernel::Fused:
+                return attention_option_value(attention_kernel_);
         }
-        return 8;
+        return 16;
     }
 
     std::string segment_dir_;
@@ -1076,6 +1116,7 @@ struct RoformerSeparator::Impl {
             core_options.backend = options.backend;
             core_options.precision = options.precision;
             core_options.threads = options.threads;
+            core_options.attention_option = attention_option_value(options.attention_kernel);
             core = std::make_unique<MNNMaskCore>(options.core_model_path, core_options);
         } else {
             if (options.segment_dir.empty()) {

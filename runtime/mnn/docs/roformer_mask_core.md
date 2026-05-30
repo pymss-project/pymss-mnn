@@ -60,6 +60,27 @@ python tools/mnn_export/export_roformer_mask_core.py \
   --out-dir benchmark_results/mnn_core_fused
 ```
 
+For custom mobile shapes, the full-core exporter accepts the same
+`--frames`, `--chunk-size`, `--overlap-size`, and `--variant-name` overrides as
+the segmented exporter.
+
+The Expr segmented exporter can also emit a single fixed-shape mask-core graph
+with native `FmhaV2` attention. This path avoids the older ONNX full-core
+boundary and is the preferred larger-graph experiment for f180 mobile shapes:
+
+```sh
+python tools/mnn_export/export_expr_micro_segments.py \
+  --preset bsr_hyperace_voc \
+  --variant-name bsr_hyperace_voc_f180_fmha_b12_core \
+  --frames 180 \
+  --out-dir benchmark_results/mnn_work \
+  --only core_model \
+  --attention-op fmha_v2 \
+  --transformer-block-size 12 \
+  --transformer-block-mode batched \
+  --mask-group-size 8
+```
+
 Run the C++ separator with the full-core graph:
 
 ```sh
@@ -74,6 +95,9 @@ runtime/mnn/build/mss_mnn_roformer_separate \
   --threads 1
 ```
 
+For the Expr `FmhaV2` mask-core graph, use the generated
+`*_expr_mask_core.mnn` path and keep `--attention-kernel fused`.
+
 Refresh manifests after partial re-export:
 
 ```sh
@@ -83,7 +107,8 @@ python tools/mnn_export/export_expr_micro_segments.py --preset bsr_hyperace_voc 
 python tools/mnn_export/export_expr_micro_segments.py --preset mbr_deux --out-dir benchmark_results/mnn_work --only manifest --time-batch 1 --freq-batch 16
 ```
 
-Export native MNN `Attention` transformer segments for flash attention:
+Export packed native `FmhaV2` transformer blocks for the fused Metal attention
+path:
 
 ```sh
 python tools/mnn_export/export_expr_micro_segments.py \
@@ -91,48 +116,45 @@ python tools/mnn_export/export_expr_micro_segments.py \
   --out-dir benchmark_results/mnn_flash_attention \
   --time-batch 1 \
   --freq-batch 1 \
-  --attention-op mnn \
-  --transformer-split attention_ffn
+  --attention-op fmha_v2 \
+  --transformer-block-size 6
 
 python tools/mnn_export/export_expr_micro_segments.py \
   --preset mbr_deux \
   --out-dir benchmark_results/mnn_flash_attention \
   --time-batch 1 \
   --freq-batch 1 \
-  --attention-op mnn \
-  --transformer-split attention_ffn
+  --attention-op fmha_v2 \
+  --transformer-block-size 6
 ```
 
-`--attention-op mnn` replaces each transformer segment's
-`MatMul -> Softmax -> MatMul` attention with one MNN `Attention` op and records
-`"attention_op": "mnn"` in `manifest.json`. When the transformer input batch is
-larger than one, the exporter emits one batch=1 MNN `Attention` op per
-independent sequence and concatenates the results, because MNN's native
-`Attention` batch dimension is not numerically reliable for RoFormer. Linear,
-gate, FFN, and residual work remains batched. `--transformer-split
-attention_ffn` exports each transformer as `*_attn.mnn` and `*_ffn.mnn`, letting
-the C++ runtime choose precision per op group. The C++ runtime reads the
-manifest and sets
-`Interpreter::ATTENTION_OPTION=8` for `layer_*_attn` sessions by default. Pass
-`--attention-kernel simple|flash` to the C++ separator to choose
-`ATTENTION_OPTION=0` or `8` for native-attention segments. The linked MNN SDK
-must be built with `-DMNN_SUPPORT_TRANSFORMER_FUSE=ON`; otherwise C++
-execution fails with unsupported `Attention`.
+`--attention-op fmha_v2` replaces each transformer segment's
+`MatMul -> Softmax -> MatMul` attention with packed MNN `FmhaV2` ops and records
+`"attention_op": "fmha_v2"` in `manifest.json`. The C++ runtime reads the
+manifest and uses `--attention-kernel fused` by default, which maps to
+`Interpreter::ATTENTION_OPTION=16` for `layer_*` and `block_*` native-attention
+sessions. Pass `--attention-kernel simple|flash|fused` to choose
+`ATTENTION_OPTION=0`, `8`, or `16`.
+
+The linked MNN SDK must be built with `-DMNN_SUPPORT_TRANSFORMER_FUSE=ON`.
+`--attention-kernel fused` additionally requires this repository's MNN fork,
+which adds a Metal `FmhaV2` backend wrapper and non-causal fused-attention fixes.
+An unmodified upstream MNN SDK can still run the older `--attention-op mnn`
+flash path with `--attention-kernel flash`.
 
 On Metal/Auto, split native-attention exports use the validated per-family
 policy. BSR-family `*_attn` sessions can run in `Normal`/FP16 while `*_ffn`
 stays `High`; MelBandRoFormer `*_attn` and `*_ffn` stay `High` because FP16
 attention accumulates too much end-to-end error. Unsplit native-attention
-transformer sessions are also forced to `High`. MNN's current Metal fused path
-is not exposed here because it needs SDK source changes for correct non-causal
-RoFormer attention; this repository keeps the open-source runtime on unmodified
-MNN SDKs.
+transformer sessions are also forced to `High`. Block exports run in `Normal`
+by default on Metal; local f180 validation showed explicit `High` block sessions
+can produce near-silent output, while `Normal` matched the manual-attention MNN
+block export on the 10-second and full-audio checks.
 
-The batch-unrolled native-attention exporter also works inside block graphs. A
-BSR `frames=180` `block_00` probe with shape `[1, 180, 62, 256]` matched the
-PyTorch block at high precision with `rmse=1.83e-4` (`ref_rms=0.731`, including
-the known GELU approximation difference). The same block graph runs with
-unmodified MNN Metal flash attention.
+The packed native-attention exporter also works inside block graphs. A BSR
+`frames=180` `block_00` probe with shape `[1, 180, 62, 256]` matched the
+manual MNN block export exactly in the local Metal end-to-end checks. Use
+explicit `--precision high` only as a diagnostic mode for these block exports.
 
 Validate one mask-core chunk:
 
@@ -224,10 +246,12 @@ precision while `*_ffn` stays high precision; MelBandRoFormer `*_attn` and
 for the absolute lowest-memory manual-attention run, `--precision-policy
 metal-autocast` for tighter CPU/Metal parity, and `--precision high
 --precision-policy uniform` for a full high-precision reference run. Use
-`--segment-cache mask-heads` on block exports to reuse the smaller
-band/mask/segm sessions without keeping large transformer blocks resident,
-`--segment-cache all` for maximum throughput, or `--segment-cache none` only
-when profiling backend allocation behavior.
+`--segment-cache auto` is the mobile-first default: coarse block exports such as
+`--transformer-block-size 6` keep the block sessions resident, while smaller
+block exports avoid caching the large transformer sessions. Use
+`--segment-cache all` for maximum throughput, `--segment-cache mask-heads` for
+lower memory, or `--segment-cache none` only when profiling backend allocation
+behavior.
 
 The Expr exporter maps RoFormer FFN GELU to MNN's native `UnaryOp GELU`.
 This avoids the Metal fallback triggered by the previous `ERF`-based exact
@@ -363,7 +387,7 @@ Block-core exports are the next reduction step for the small-session bottleneck:
 python tools/mnn_export/export_expr_micro_segments.py \
   --preset bsr_hyperace_voc \
   --out-dir benchmark_results/mnn_work \
-  --transformer-block-size 1 \
+  --transformer-block-size 6 \
   --transformer-block-mode batched \
   --mask-group-size 8 \
   --time-batch 1 \
@@ -376,8 +400,9 @@ naive block exports numerically invalid. A one-block CPU check for
 `bsr_hyperace_voc` matched PyTorch at `rmse=7.34e-07`. The diagnostic
 `--transformer-block-mode unrolled` keeps the original band-wise time
 transformer semantics inside one graph, but it creates very large model files
-and should not be used as the mobile default. The C++ runtime does not cache
-`block_*.mnn` sessions by default to avoid 16GB-class memory pressure.
+and should not be used as the mobile default. The C++ runtime's `auto` cache
+policy keeps `transformer_block_size=6` blocks resident, and avoids caching
+smaller block exports that can exceed low-memory targets.
 
 For mobile memory work, reduce the fixed frame count instead of only changing
 session granularity:
@@ -388,22 +413,39 @@ python tools/mnn_export/export_expr_micro_segments.py \
   --variant-name bsr_hyperace_voc_f180 \
   --frames 180 \
   --out-dir benchmark_results/mnn_work \
-  --transformer-block-size 1 \
+  --transformer-block-size 6 \
   --transformer-block-mode batched \
   --mask-group-size 8
 ```
 
 For `bsr_hyperace_voc`, `--frames 180` produces metadata shape
-`[1, 2050, 180, 2]`, `chunk_size=91648`, and `overlap_size=4582`. A 1-second
-Metal smoke test with `precision=Normal`, `segment_cache=None`, and block
-segments finished with `peak memory footprint=1.93GB`, below the 2GB mobile
-target. The steady-state RTF estimate is about `2.24` (`~0.45x` realtime) from
-the 1-second smoke profile. Time attention memory scales with `frames^2`, so
-this cuts the main attention working set to roughly 3.7% of the default
-938-frame export per chunk. Larger probes did not meet the same local target:
-`frames=256` exited abnormally at `peak memory footprint=3.17GB`, `frames=192`
-exited abnormally at `2.10GB`, and `frames=184` exited abnormally at `1.98GB`
-on the 16GB M4 MacBook Air test machine.
+`[1, 2050, 180, 2]`, `chunk_size=91648`, and `overlap_size=4582`. With the
+forked MNN Metal `FmhaV2` path, `transformer_block_size=12`,
+`segment_cache=all`, and default `precision=Normal`, the 16GB M4 MacBook Air ran
+the full `test.m4a` (`311.61s`) as `test_full.wav` in `231.51s` with peak
+footprint `1.41 GiB` (`RTF=0.74`). The same 10-second input matched the manual
+attention b12 export exactly (`max_abs=0`, `rmse=0`). The remaining full-audio
+profile was still dominated by transformer work: `run_session=118.78s` and
+`output_copy=93.72s` across 158 chunks.
+
+Before the `FmhaV2` Metal path, the comparable manual-attention f180 b6/b12
+full-audio runs were around `299-315s` at `1.40-1.50 GiB`, so the fused path is
+materially faster but still leaves host output copy as a major bottleneck. Time
+attention memory scales with `frames^2`, so `frames=180` cuts the main attention
+working set to roughly 3.7% of the default 938-frame export per chunk. Larger
+frame probes did not meet the same local target: `frames=256` exited abnormally
+at `peak memory footprint=3.17GB`, `frames=192` exited abnormally at `2.10GB`,
+and `frames=184` exited abnormally at `1.98GB` on the same test machine.
+
+The Expr `FmhaV2` f180 mask-core graph validates numerically, but it is not yet a
+speed win. The b12 core model is about `201 MiB`; on the same full `test.m4a`
+input it matched the segmented output exactly (`max_abs=0`, `rmse=0`) and cut
+`output_copy` from `93.72s` to `1.80s`, but `run_session` rose to `225.78s`.
+End-to-end time was `236.16s`, peak footprint was `1.42 GiB`, effectively tied
+with the segmented fused run (`231.51s`). This shows the previous
+`output_copy` bucket was mostly deferred Metal synchronization, not plain host
+copy. A b6 Expr core matched b12 on the 10-second output and had the same
+per-chunk runtime, so block size was not the cause.
 
 The historical unsplit native-attention `freq_batch=16` probe was rejected:
 it ran `bsr_hyperace_voc` in `143.87s` but changed the 60-second vocals output
@@ -425,5 +467,9 @@ bsr_hyperace_voc full mask core, Metal Normal:
   rejected: vs High rmse=2.00e-02
 ```
 
-The MBR full-core graph currently converts but returns all-zero MNN output on a
-random mask-core input, so it is not a valid speed path yet.
+The ONNX full-core MBR graph currently converts but returns all-zero MNN output
+on a random mask-core input, so it is not a valid speed path yet. The historical
+ONNX f180 full-core BSR export is also rejected for the Metal runtime path: it
+matched PyTorch on a random input under PyMNN CPU (`rmse=1.93e-06`), but PyMNN
+Metal returned all-zero masks for the same random input. Prefer the Expr
+`--only core_model` path above when testing larger BSR graphs.

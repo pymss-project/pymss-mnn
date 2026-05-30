@@ -52,6 +52,7 @@ enum class RoformerPrecisionPolicy {
 };
 
 enum class RoformerSegmentCachePolicy {
+    Auto,
     All,
     TransformersOnly,
     BlocksOnly,
@@ -62,6 +63,7 @@ enum class RoformerSegmentCachePolicy {
 enum class RoformerAttentionKernel {
     Simple,
     Flash,
+    Fused,
 };
 
 RoformerPrecisionPolicy roformer_precision_policy_from_name(const std::string& name);
@@ -76,10 +78,10 @@ struct RoformerSeparatorOptions {
     std::string core_model_path;
     std::string metadata_path;
     MNNBackend backend = MNNBackend::CPU;
-    MNNPrecision precision = MNNPrecision::Auto;
+    MNNPrecision precision = MNNPrecision::Normal;
     RoformerPrecisionPolicy precision_policy = RoformerPrecisionPolicy::MetalFast;
-    RoformerSegmentCachePolicy segment_cache_policy = RoformerSegmentCachePolicy::TransformersOnly;
-    RoformerAttentionKernel attention_kernel = RoformerAttentionKernel::Flash;
+    RoformerSegmentCachePolicy segment_cache_policy = RoformerSegmentCachePolicy::Auto;
+    RoformerAttentionKernel attention_kernel = RoformerAttentionKernel::Fused;
     int threads = 1;
     bool profile = false;
 };
