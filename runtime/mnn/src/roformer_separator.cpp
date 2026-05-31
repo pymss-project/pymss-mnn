@@ -1207,11 +1207,20 @@ std::vector<AudioBuffer> RoformerSeparator::separate(const AudioBuffer& audio) {
     for (int start = 0; start < total; start += step) {
         starts.push_back(start);
     }
+    auto report_progress = [&](float value, const std::string& label) {
+        if (!impl_->options.progress_callback) {
+            return;
+        }
+        const float clamped = std::max(0.0f, std::min(1.0f, value));
+        impl_->options.progress_callback(clamped, label);
+    };
+    report_progress(0.0f, "separate");
 
     const auto normal_window = windowing_array(metadata.chunk_size, fade_size);
     std::vector<float> result(static_cast<std::size_t>(metadata.stems * audio.channels) * total, 0.0f);
     std::vector<float> counter(static_cast<std::size_t>(total), 0.0f);
-    for (int start : starts) {
+    for (std::size_t chunk_index = 0; chunk_index < starts.size(); ++chunk_index) {
+        const int start = starts[chunk_index];
         ScopedAutoreleasePool autorelease_pool;
         int valid = 0;
         auto stage_start = Clock::now();
@@ -1233,6 +1242,8 @@ std::vector<AudioBuffer> RoformerSeparator::separate(const AudioBuffer& audio) {
             counter[static_cast<std::size_t>(start + i)] += window[static_cast<std::size_t>(i)];
         }
         impl_->profile.add("dsp.overlap_add", elapsed_ms(stage_start));
+        const float chunk_progress = starts.empty() ? 1.0f : static_cast<float>(chunk_index + 1) / static_cast<float>(starts.size());
+        report_progress(chunk_progress, "separate");
     }
 
     int crop_start = 0;
@@ -1260,6 +1271,7 @@ std::vector<AudioBuffer> RoformerSeparator::separate(const AudioBuffer& audio) {
     impl_->profile.add("total.separate", elapsed_ms(total_start));
     impl_->last_profile_report = impl_->profile.report();
     impl_->profile.print(std::cerr);
+    report_progress(1.0f, "complete");
     return outputs;
 }
 

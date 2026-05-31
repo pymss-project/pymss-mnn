@@ -3,6 +3,7 @@
 #include "mss_mnn/audio.hpp"
 #include "mss_mnn/mnn_mask_core.hpp"
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -86,6 +87,7 @@ struct RoformerSeparatorOptions {
     bool profile = false;
     bool profile_ops = false;
     int profile_op_top_n = 20;
+    std::function<void(float, const std::string&)> progress_callback;
 };
 
 RoformerMetadata load_roformer_metadata(const std::string& path);
